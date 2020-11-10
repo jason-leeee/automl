@@ -26,7 +26,6 @@ from backbone import efficientnet_builder
 from keras import fpn_configs
 from keras import postprocess
 from keras import util_keras
-from keras import tfmot
 # pylint: disable=arguments-differ  # fo keras layers.
 
 
@@ -46,7 +45,6 @@ class FNode(tf.keras.layers.Layer):
                strategy,
                weight_method,
                data_format,
-               model_optimizations,
                name='fnode'):
     super().__init__(name=name)
     self.feat_level = feat_level
@@ -63,7 +61,6 @@ class FNode(tf.keras.layers.Layer):
     self.conv_bn_act_pattern = conv_bn_act_pattern
     self.resample_layers = []
     self.vars = []
-    self.model_optimizations = model_optimizations
 
   def fuse_features(self, nodes):
     """Fuse features from different resolutions and return a weighted sum.
@@ -139,7 +136,6 @@ class FNode(tf.keras.layers.Layer):
               self.conv_after_downsample,
               strategy=self.strategy,
               data_format=self.data_format,
-              model_optimizations=self.model_optimizations,
               name=name))
     if self.weight_method == 'attn':
       self._add_wsm('ones')
@@ -159,7 +155,6 @@ class FNode(tf.keras.layers.Layer):
         self.act_type,
         self.data_format,
         self.strategy,
-        self.model_optimizations,
         name='op_after_combine{}'.format(len(feats_shape)))
     self.built = True
     super().build(feats_shape)
@@ -186,7 +181,6 @@ class OpAfterCombine(tf.keras.layers.Layer):
                act_type,
                data_format,
                strategy,
-               model_optimizations,
                name='op_after_combine'):
     super().__init__(name=name)
     self.conv_bn_act_pattern = conv_bn_act_pattern
@@ -209,10 +203,6 @@ class OpAfterCombine(tf.keras.layers.Layer):
         use_bias=not self.conv_bn_act_pattern,
         data_format=self.data_format,
         name='conv')
-    if model_optimizations:
-      for method in model_optimizations.keys():
-        self.conv_op = (
-            tfmot.get_method(method)(self.conv_op))
     self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
@@ -242,7 +232,6 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
                data_format=None,
                pooling_type=None,
                upsampling_type=None,
-               model_optimizations=None,
                name='resample_p0'):
     super().__init__(name=name)
     self.apply_bn = apply_bn
@@ -260,9 +249,6 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
         padding='same',
         data_format=self.data_format,
         name='conv2d')
-    if model_optimizations:
-      for method in model_optimizations.keys():
-        self.conv2d = tfmot.get_method(method)(self.conv2d)
     self.bn = util_keras.build_batch_norm(
         is_training_bn=self.is_training_bn,
         data_format=self.data_format,
@@ -279,13 +265,14 @@ class ResampleFeatureMap(tf.keras.layers.Layer):
           strides=[height_stride_size, width_stride_size],
           padding='SAME',
           data_format=self.data_format)(inputs)
-    if self.pooling_type == 'avg':
+    elif self.pooling_type == 'avg':
       return tf.keras.layers.AveragePooling2D(
           pool_size=[height_stride_size + 1, width_stride_size + 1],
           strides=[height_stride_size, width_stride_size],
           padding='SAME',
           data_format=self.data_format)(inputs)
-    raise ValueError('Unsupported pooling type {}.'.format(self.pooling_type))
+    else:
+      raise ValueError('Unsupported pooling type {}.'.format(self.pooling_type))
 
   def _upsample2d(self, inputs, target_height, target_width):
     return tf.cast(
@@ -347,7 +334,6 @@ class ClassNet(tf.keras.layers.Layer):
                survival_prob=None,
                strategy=None,
                data_format='channels_last',
-               grad_checkpoint=False,
                name='class_net',
                **kwargs):
     """Initialize the ClassNet.
@@ -384,14 +370,13 @@ class ClassNet(tf.keras.layers.Layer):
     self.data_format = data_format
     self.conv_ops = []
     self.bns = []
-    self.grad_checkpoint = grad_checkpoint
     if separable_conv:
       conv2d_layer = functools.partial(
           tf.keras.layers.SeparableConv2D,
           depth_multiplier=1,
           data_format=data_format,
-          pointwise_initializer=tf.initializers.variance_scaling(),
-          depthwise_initializer=tf.initializers.variance_scaling())
+          pointwise_initializer=tf.initializers.VarianceScaling(),
+          depthwise_initializer=tf.initializers.VarianceScaling())
     else:
       conv2d_layer = functools.partial(
           tf.keras.layers.Conv2D,
@@ -426,33 +411,21 @@ class ClassNet(tf.keras.layers.Layer):
         padding='same',
         name='class-predict')
 
-  @tf.autograph.experimental.do_not_convert
-  def _conv_bn_act(self, image, i, level_id, training):
-    conv_op = self.conv_ops[i]
-    bn = self.bns[i][level_id]
-    act_type = self.act_type
-
-    @utils.recompute_grad(self.grad_checkpoint)
-    def _call(image):
-      original_image = image
-      image = conv_op(image)
-      image = bn(image, training=training)
-      if self.act_type:
-        image = utils.activation_fn(image, act_type)
-      if i > 0 and self.survival_prob:
-        image = utils.drop_connect(image, training, self.survival_prob)
-        image = image + original_image
-      return image
-
-    return _call(image)
-
   def call(self, inputs, training, **kwargs):
     """Call ClassNet."""
+
     class_outputs = []
     for level_id in range(0, self.max_level - self.min_level + 1):
       image = inputs[level_id]
       for i in range(self.repeats):
-        image = self._conv_bn_act(image, i, level_id, training)
+        original_image = image
+        image = self.conv_ops[i](image)
+        image = self.bns[i][level_id](image, training=training)
+        if self.act_type:
+          image = utils.activation_fn(image, self.act_type)
+        if i > 0 and self.survival_prob:
+          image = utils.drop_connect(image, training, self.survival_prob)
+          image = image + original_image
 
       class_outputs.append(self.classes(image))
 
@@ -474,7 +447,6 @@ class BoxNet(tf.keras.layers.Layer):
                survival_prob=None,
                strategy=None,
                data_format='channels_last',
-               grad_checkpoint=False,
                name='box_net',
                **kwargs):
     """Initialize BoxNet.
@@ -508,7 +480,6 @@ class BoxNet(tf.keras.layers.Layer):
     self.act_type = act_type
     self.strategy = strategy
     self.data_format = data_format
-    self.grad_checkpoint = grad_checkpoint
 
     self.conv_ops = []
     self.bns = []
@@ -520,8 +491,8 @@ class BoxNet(tf.keras.layers.Layer):
             tf.keras.layers.SeparableConv2D(
                 filters=self.num_filters,
                 depth_multiplier=1,
-                pointwise_initializer=tf.initializers.variance_scaling(),
-                depthwise_initializer=tf.initializers.variance_scaling(),
+                pointwise_initializer=tf.initializers.VarianceScaling(),
+                depthwise_initializer=tf.initializers.VarianceScaling(),
                 data_format=self.data_format,
                 kernel_size=3,
                 activation=None,
@@ -555,8 +526,8 @@ class BoxNet(tf.keras.layers.Layer):
       self.boxes = tf.keras.layers.SeparableConv2D(
           filters=4 * self.num_anchors,
           depth_multiplier=1,
-          pointwise_initializer=tf.initializers.variance_scaling(),
-          depthwise_initializer=tf.initializers.variance_scaling(),
+          pointwise_initializer=tf.initializers.VarianceScaling(),
+          depthwise_initializer=tf.initializers.VarianceScaling(),
           data_format=self.data_format,
           kernel_size=3,
           activation=None,
@@ -574,33 +545,21 @@ class BoxNet(tf.keras.layers.Layer):
           padding='same',
           name='box-predict')
 
-  @tf.autograph.experimental.do_not_convert
-  def _conv_bn_act(self, image, i, level_id, training):
-    conv_op = self.conv_ops[i]
-    bn = self.bns[i][level_id]
-    act_type = self.act_type
-
-    @utils.recompute_grad(self.grad_checkpoint)
-    def _call(image):
-      original_image = image
-      image = conv_op(image)
-      image = bn(image, training=training)
-      if self.act_type:
-        image = utils.activation_fn(image, act_type)
-      if i > 0 and self.survival_prob:
-        image = utils.drop_connect(image, training, self.survival_prob)
-        image = image + original_image
-      return image
-
-    return _call(image)
-
   def call(self, inputs, training):
     """Call boxnet."""
     box_outputs = []
     for level_id in range(0, self.max_level - self.min_level + 1):
       image = inputs[level_id]
       for i in range(self.repeats):
-        image = self._conv_bn_act(image, i, level_id, training)
+        original_image = image
+        image = self.conv_ops[i](image)
+        image = self.bns[i][level_id](image, training=training)
+        if self.act_type:
+          image = utils.activation_fn(image, self.act_type)
+        if i > 0 and self.survival_prob:
+          image = utils.drop_connect(image, training, self.survival_prob)
+          image = image + original_image
+
       box_outputs.append(self.boxes(image))
 
     return box_outputs
@@ -669,6 +628,208 @@ class SegmentationHead(tf.keras.layers.Layer):
     return self.head_transpose(x)  # 64x64 -> 128x128
 
 
+class RPN(tf.keras.layers.Layer):
+  """RPN network"""
+  def __init__(self, min_level, max_level, num_anchors, anchor_stride, data_format):
+    """
+    Args:
+      min_level: minimum level for features.
+      max_level: maximum level for features.
+      num_anchors: number of anchors.
+      anchor_stride: stride of anchors.
+      data_format: string of "channel_first" or "channer_last"
+    """
+    super().__init__()
+    self.rpn_conv_block = []
+    self.rpn_mask_logit = []
+    self.rpn_box_refine = []
+    self.num_anchors = num_anchors
+    for _ in range(max_level - min_level):
+      self.rpn_conv_block.append(
+        tf.keras.layers.Conv2D(512, 3, 
+        padding="same", 
+        activation="relu",
+        data_format = data_format,
+        strides=anchor_stride)
+      )
+      self.rpn_mask_logit.append(
+        tf.keras.layers.Conv2D(2*num_anchors, 1, padding="valid", data_format=data_format, activation="linear")
+      )
+      self.rpn_box_refine.append(
+        tf.keras.layers.conv2D(4*num_anchors, 1, padding="valid", data_format=data_format, activation="linear")
+      )
+    
+  def call(self, feats):
+    level_bbox = []
+    level_prob = []
+    level_logits = []
+    for feat, conv, mask, box in zip(feats, self.rpn_conv_block, self.rpn_mask_logit, self.rpn_box_refine):
+      shared_feature = conv(feat)
+      # Mask logits and probs
+      x = mask(shared_feature)
+      rpn_class_logits = tf.keras.layers.Lambda(lambda t: tf.reshape(t, [-1, self.num_anchors, 2]))(x)
+      rpn_class_probs = tf.keras.layers.Activation("softmax")(rpn_class_logits)
+      level_logits.append(rpn_class_logits)
+      level_prob.append(rpn_class_probs)
+      # Refine bounding box 
+      x = box(shared_feature)
+      rpn_bbox = tf.keras.layers.Lambda(lambda t: tf.reshape(t, [-1, self.num_anchors, 4]))(x)
+      level_bbox.append(rpn_bbox)
+    return level_bbox, level_prob, level_logits 
+
+
+class ROIAlign(tf.keras.layers.Layer):
+  """ROI align layer"""
+  def __init__(self, min_level, max_level, pool_size, **kwargs):
+    super().__init__(**kwargs)
+    self.pool_size = pool_size
+    self.min_level = min_level
+    self.max_level = max_level
+
+  def call(self, config, boxes, feature_maps):
+    """
+    Args: 
+      config: the config file 
+      boxes: has shape [batch, num_boxes, 4] in normalized coords
+      feature_maps: list of feature maps computed from the backbone
+    """
+    # Assign each ROI to a level in the pyramid based on the ROI area.
+    y1, x1, y2, x2 = tf.split(boxes, 4, axis=2)
+    h = y2 - y1
+    w = x2 - x1
+    # Use shape of first image. Images in a batch must have the same size.
+    image_shape = config.image_size
+    # Equation 1 in the Feature Pyramid Networks paper. Account for
+    # the fact that our coordinates are normalized here.
+    # e.g. a 224x224 ROI (in pixels) maps to P4
+    image_area = tf.cast(image_shape[0] * image_shape[1], tf.float32)
+    roi_level = utils.log2_graph(tf.sqrt(h * w) / (224.0 / tf.sqrt(image_area)))
+    roi_level = tf.minimum(5, tf.maximum(
+        2, 4 + tf.cast(tf.round(roi_level), tf.int32)))
+    roi_level = tf.squeeze(roi_level, 2)
+
+    # Loop through levels and apply ROI pooling to each. P2 to P5.
+    pooled = []
+    box_to_level = []
+    for i, level in enumerate(range(self.min_level, self.max_level)):
+        ix = tf.where(tf.equal(roi_level, level))
+        level_boxes = tf.gather_nd(boxes, ix)
+
+        # Box indices for crop_and_resize.
+        box_indices = tf.cast(ix[:, 0], tf.int32)
+
+        # Keep track of which box is mapped to which level
+        box_to_level.append(ix)
+
+        # Stop gradient propogation to ROI proposals
+        level_boxes = tf.stop_gradient(level_boxes)
+        box_indices = tf.stop_gradient(box_indices)
+
+        # Crop and Resize
+        # From Mask R-CNN paper: "We sample four regular locations, so
+        # that we can evaluate either max or average pooling. In fact,
+        # interpolating only a single value at each bin center (without
+        # pooling) is nearly as effective."
+        #
+        # Here we use the simplified approach of a single value per bin,
+        # which is how it's done in tf.crop_and_resize()
+        # Result: [batch * num_boxes, pool_height, pool_width, channels]
+        pooled.append(tf.image.crop_and_resize(
+            feature_maps[i], level_boxes, box_indices, self.pool_shape,
+            method="bilinear"))
+
+    # Pack pooled features into one tensor
+    pooled = tf.concat(pooled, axis=0)
+
+    # Pack box_to_level mapping into one array and add another
+    # column representing the order of pooled boxes
+    box_to_level = tf.concat(box_to_level, axis=0)
+    box_range = tf.expand_dims(tf.range(tf.shape(box_to_level)[0]), 1)
+    box_to_level = tf.concat([tf.cast(box_to_level, tf.int32), box_range],
+                              axis=1)
+
+    # Rearrange pooled features to match the order of the original boxes
+    # Sort box_to_level by batch then box index
+    # TF doesn't have a way to sort by two columns, so merge them and sort.
+    sorting_tensor = box_to_level[:, 0] * 100000 + box_to_level[:, 1]
+    ix = tf.nn.top_k(sorting_tensor, k=tf.shape(
+        box_to_level)[0]).indices[::-1]
+    ix = tf.gather(box_to_level[:, 2], ix)
+    pooled = tf.gather(pooled, ix)
+
+    # Re-add the batch dimension
+    shape = tf.concat([tf.shape(boxes)[:2], tf.shape(pooled)[1:]], axis=0)
+    pooled = tf.reshape(pooled, shape)
+    return pooled
+
+  def compute_output_shape(self, input_shape):
+        return input_shape[0][:2] + self.pool_shape + (input_shape[2][-1], )
+    
+
+class InstanceHead(tf.keras.layers.Layer):
+  """Layer for instance segmentation"""
+  def __init__(self, num_classes, act_type, pool_size, 
+              is_training_bn, data_format, strategy, **kwargs):
+    """
+    Initialize InstanceHead layers.
+
+    Args:
+      num_classes: Number of clasees
+      act_type: String of the activation used
+      pool_size: The width of the square feature map generated from ROI Pooling.
+      data_format: String of 'channel_first' or 'channels_last'.
+      is_training_bn: True if we train the BatchNorm.
+      strategy: String to specify training strategy for TPU/GPU/CPU.
+    """
+    super().__init__(**kwargs)
+    self.num_classes = num_classes
+    self.act_type = act_type
+    self.conv_layers = []
+    self.conv_bns = []
+    
+    for i in range(4):
+      self.conv_layers.append(
+        tf.keras.layers.TimeDistributed(
+          tf.keras.layers.Conv2D(
+            256,
+            3,
+            padding="same",
+            data_format = data_format
+          )
+        )
+      )
+
+      self.conv_bns.append(
+        tf.keras.layers.TimeDistributed(
+          util_keras.build_batch_norm(
+              is_training_bn=is_training_bn,
+              data_format=data_format,
+              strategy=strategy,
+              name='bn'
+          )
+        )
+      )
+
+      self.head_transpose = tf.keras.layers.TimeDistributed(
+        tf.keras.layers.Conv2DTranspose(256, 2, strides=2, data_format=data_format, activation="relu")
+      )
+      self.instance_map = tf.keras.layers.TimeDistributed(
+        tf.keras.layers.conv2D(num_classes, 1, data_format=data_format, activation="sigmoid")
+      )
+    
+  def call(self, x, training):
+    """
+    Args:
+      x: The tensor of roi features 
+    """
+    for conv_2d, conv_bn in zip(self.conv_layers, self.conv_bns):
+      x = conv_2d(x)
+      x = conv_bn(x, training)
+      x = utils.activation_fn(x, self.act_type)
+    x = self.head_transpose(x)
+    x = self.instance_map(x)
+    return x
+
 class FPNCells(tf.keras.layers.Layer):
   """FPN cells."""
 
@@ -734,17 +895,13 @@ class FPNCell(tf.keras.layers.Layer):
           strategy=config.strategy,
           weight_method=self.fpn_config.weight_method,
           data_format=config.data_format,
-          model_optimizations=config.model_optimizations,
           name='fnode%d' % i)
       self.fnodes.append(fnode)
 
   def call(self, feats, training):
-    @utils.recompute_grad(self.config.grad_checkpoint)
-    def _call(feats):
-      for fnode in self.fnodes:
-        feats = fnode(feats, training)
-      return feats
-    return _call(feats)
+    for fnode in self.fnodes:
+      feats = fnode(feats, training)
+    return feats
 
 
 class EfficientDetNet(tf.keras.Model):
@@ -766,7 +923,6 @@ class EfficientDetNet(tf.keras.Model):
               utils.batch_norm_class(is_training_bn, config.strategy),
           'relu_fn':
               functools.partial(utils.activation_fn, act_type=config.act_type),
-          'grad_checkpoint': self.config.grad_checkpoint
       }
       if 'b0' in backbone_name:
         override_params['survival_prob'] = 0.0
@@ -791,7 +947,6 @@ class EfficientDetNet(tf.keras.Model):
               conv_after_downsample=config.conv_after_downsample,
               strategy=config.strategy,
               data_format=config.data_format,
-              model_optimizations=config.model_optimizations,
               name='resample_p%d' % level,
           ))
     self.fpn_cells = FPNCells(config)
@@ -813,7 +968,6 @@ class EfficientDetNet(tf.keras.Model):
             separable_conv=config.separable_conv,
             survival_prob=config.survival_prob,
             strategy=config.strategy,
-            grad_checkpoint=config.grad_checkpoint,
             data_format=config.data_format)
 
         self.box_net = BoxNet(
@@ -827,7 +981,6 @@ class EfficientDetNet(tf.keras.Model):
             separable_conv=config.separable_conv,
             survival_prob=config.survival_prob,
             strategy=config.strategy,
-            grad_checkpoint=config.grad_checkpoint,
             data_format=config.data_format)
 
       if head == 'segmentation':
