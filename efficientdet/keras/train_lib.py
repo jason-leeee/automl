@@ -525,6 +525,109 @@ class BoxIouLoss(tf.keras.losses.Loss):
     return box_iou_loss
 
 
+#TODO: define the rpn losses and/or instance mask loss
+class RPNClassLoss(tf.keras.losses.Loss):
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+
+  def call(self, rpn_match, rpn_class_logits):
+    """RPN anchor classifier loss.
+    rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
+               -1=negative, 0=neutral anchor.
+    rpn_class_logits: [batch, anchors, 2]. RPN classifier logits for BG/FG.
+    """
+    # Squeeze last dim to simplify
+    rpn_match = tf.squeeze(rpn_match, -1)
+    # Get anchor classes. Convert the -1/+1 match to 0/1 values.
+    anchor_class = tf.cast(tf.keras.backend.equal(rpn_match, 1), tf.int32)
+    # Positive and Negative anchors contribute to the loss,
+    # but neutral anchors (match value = 0) don't.
+    indices = tf.where(tf.keras.backend.not_equal(rpn_match, 0))
+    # Pick rows that contribute to the loss and filter out the rest.
+    rpn_class_logits = tf.gather_nd(rpn_class_logits, indices)
+    anchor_class = tf.gather_nd(anchor_class, indices)
+    # Cross entropy loss
+    loss = tf.keras.losses.sparse_categorical_crossentropy(anchor_class,
+                                                          rpn_class_logits,
+                                                          from_logits=True)
+    loss = tf.keras.backend.switch(tf.size(loss) > 0, tf.keras.backend.mean(loss), tf.constant(0.0))
+    return loss
+
+
+class RPNBboxLoss(tf.keras.losses.Loss):
+  def __init__(self, delta = 0.1, **kwargs):
+    super().__init__(**kwargs)
+    self.huber = tf.keras.losses.Huber(
+        delta, reduction=tf.keras.losses.Reduction.NONE)
+
+  def call(self, rpn_match, rpn_bbox, y_true):
+    """
+    Args:
+      y_true: [num_positives, box_targets], box_targets has shape
+        [batch_size * height* width *anchors, 4]
+      rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
+               -1=negative, 0=neutral anchor.
+      rpn_bbox: [batch, anchors, (dx, dy, log(dh), log(dw))] 
+    """
+    num_positives, box_targets = y_true
+    rpn_match = tf.squeeze(rpn_match, -1)
+    indices = tf.where(tf.keras.backend.equal(rpn_match, 1))
+    rpn_bbox = tf.gather_nd(rpn_bbox, indices)
+    box_targets = tf.expand_dims(box_targets, axis=-1)
+    # TODO: Trim the targets to the same length as rpn_bbox
+    # TODO: Match the rpn_bbox coords to [ymin, xmin, ymax, xmax]
+    """
+    batch_counts = tf.sum(tf.cast(tf.keras.backend.equal(rpn_match, 1), tf.int32), axis=1)
+    box_targets = batch_pack_graph(box_targets, batch_counts,
+                                   config.IMAGES_PER_GPU)
+    """
+    box_loss = tf.cast(self.huber(box_targets, rpn_bbox),
+                       num_positives.dtype)
+    box_loss = tf.reduce_sum(box_loss) / normalizer
+    return box_loss
+
+
+class InstanceMaskLoss(tf.keras.losses.Loss):
+  def __init__(self, **kwargs):
+    super().__init__(**kwargs)
+
+  def call(self, target_masks, target_class_ids, pred_masks):
+    """Mask binary cross-entropy loss for the masks head.
+    target_masks: [batch, num_rois, height, width].
+        A float32 tensor of values 0 or 1. Uses zero padding to fill array.
+    target_class_ids: [batch, num_rois]. Integer class IDs. Zero padded.
+    pred_masks: [batch, proposals, height, width, num_classes] float32 tensor
+                with values from 0 to 1.
+    """
+    # Reshape for simplicity. Merge first two dimensions into one.
+    target_class_ids = tf.reshape(target_class_ids, (-1,))
+    mask_shape = tf.shape(target_masks)
+    target_masks = tf.reshape(target_masks, (-1, mask_shape[2], mask_shape[3]))
+    pred_shape = tf.shape(pred_masks)
+    pred_masks = tf.reshape(pred_masks,
+                           (-1, pred_shape[2], pred_shape[3], pred_shape[4]))
+    # Permute predicted masks to [N, num_classes, height, width]
+    pred_masks = tf.transpose(pred_masks, [0, 3, 1, 2])
+
+    # Only positive ROIs contribute to the loss. And only
+    # the class specific mask of each ROI.
+    positive_ix = tf.where(target_class_ids > 0)[:, 0]
+    positive_class_ids = tf.cast(
+        tf.gather(target_class_ids, positive_ix), tf.int64)
+    indices = tf.stack([positive_ix, positive_class_ids], axis=1)
+
+    # Gather the masks (predicted and true) that contribute to loss
+    y_true = tf.gather(target_masks, positive_ix)
+    y_pred = tf.gather_nd(pred_masks, indices)
+
+    # Compute binary cross entropy. If no positive ROIs, then return 0.
+    # shape: [batch, roi, num_classes]
+    loss = tf.keras.backend.switch(tf.size(y_true) > 0,
+                    tf.keras.backend.binary_crossentropy(target=y_true, output=y_pred),
+                    tf.constant(0.0))
+    loss = tf.keras.backend.mean(loss)
+    return loss
+
 class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
   """A customized trainer for EfficientDet.
 

@@ -671,11 +671,11 @@ class RPN(tf.keras.layers.Layer):
       rpn_class_probs = tf.keras.layers.Activation("softmax")(rpn_class_logits)
       level_logits.append(rpn_class_logits)
       level_prob.append(rpn_class_probs)
-      # Refine bounding box 
+      # Refine bounding box
       x = box(shared_feature)
       rpn_bbox = tf.keras.layers.Lambda(lambda t: tf.reshape(t, [-1, self.num_anchors, 4]))(x)
       level_bbox.append(rpn_bbox)
-    return level_bbox, level_prob, level_logits 
+    return level_bbox, level_prob, level_logits
 
 
 class ROIAlign(tf.keras.layers.Layer):
@@ -794,7 +794,7 @@ class InstanceHead(tf.keras.layers.Layer):
             256,
             3,
             padding="same",
-            data_format = data_format
+            data_format=data_format
           )
         )
       )
