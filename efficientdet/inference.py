@@ -694,3 +694,128 @@ class InferenceDriver(object):
         print('writing file to %s' % output_image_path)
 
       return predictions
+
+
+class ONNXDriver(object):
+  """A driver for serving single or batch images.
+
+  This driver supports serving with image files or arrays, with configurable
+  batch size.
+
+  Example 1. Serving streaming image contents:
+
+    driver = inference.ServingDriver(
+      'efficientdet-d0', '/tmp/efficientdet-d0', batch_size=1)
+    driver.build()
+    for m in image_iterator():
+      predictions = driver.serve_files([m])
+      driver.visualize(m, predictions[0])
+      # m is the new image with annotated boxes.
+  """
+
+  def __init__(self,
+               model_name: Text,
+               ckpt_path: Text,
+               batch_size: int = 1,
+               model_params: Dict[Text, Any] = None):
+    """Initialize the inference driver.
+
+    Args:
+      model_name: target model name, such as efficientdet-d0.
+      ckpt_path: checkpoint path, such as /tmp/efficientdet-d0/.
+      batch_size: batch size for inference.
+      model_params: model parameters for overriding the config.
+    """
+    self.model_name = model_name
+    self.ckpt_path = ckpt_path
+    self.batch_size = batch_size
+
+    self.params = hparams_config.get_detection_config(model_name).as_dict()
+
+    if model_params:
+      self.params.update(model_params)
+    self.params.update(dict(is_training_bn=False))
+    self.label_map = self.params.get('label_map', None)
+
+    self.signitures = None
+    self.sess = None
+
+  def __del__(self):
+    if self.sess:
+      self.sess.close()
+
+  def _build_session(self):
+    sess_config = tf.ConfigProto()
+    return tf.Session(config=sess_config)
+
+  def build(self, params_override=None):
+    """Build model and restore checkpoints."""
+    params = copy.deepcopy(self.params)
+    if params_override:
+      params.update(params_override)
+
+    if not self.sess:
+      self.sess = self._build_session()
+    with self.sess.graph.as_default():
+      img_h, img_w = utils.parse_image_size(params['image_size'])
+      raw_images = tf.placeholder(tf.float32, name='image_arrays', shape=[None, img_h, img_w, 3])
+
+      if params['data_format'] == 'channels_first':
+        images = tf.transpose(images, [0, 3, 1, 2])
+      class_outputs, box_outputs = build_model(self.model_name, raw_images,
+                                               **params)
+      params.update(dict(batch_size=self.batch_size))
+
+      # merge all detection results without nms
+      class_outputs, box_outputs = postprocess.merge_class_box_level_outputs(
+        params,
+        postprocess.to_list(class_outputs),
+        postprocess.to_list(box_outputs)
+      )
+
+      # set output layer names
+      class_outputs = tf.identity(class_outputs, 'class_outputs')
+      box_outputs = tf.identity(box_outputs, 'box_outputs')
+
+      restore_ckpt(
+          self.sess,
+          self.ckpt_path,
+          ema_decay=self.params['moving_average_decay'],
+          export_ckpt=None)
+
+    self.signitures = {
+        'image_arrays': raw_images,
+        'class_outputs': class_outputs,
+        'box_outputs': box_outputs
+    }
+    return self.signitures
+
+  def export(self,
+             output_dir: Text):
+    """Export a saved model to ONNX format.
+
+    Args:
+      output_dir: the output folder for the ONNX model.
+    """
+    signitures = self.signitures
+    signature_def_map = {
+        'serving_default':
+            tf.saved_model.predict_signature_def(
+                {
+                  signitures['image_arrays'].name: signitures['image_arrays']
+                },
+                {
+                  signitures['class_outputs'].name: signitures['class_outputs'],
+                  signitures['box_outputs'].name: signitures['box_outputs']
+                }
+            ),
+    }
+    b = tf.saved_model.Builder(output_dir)
+    b.add_meta_graph_and_variables(
+        self.sess,
+        tags=['serve'],
+        signature_def_map=signature_def_map,
+        assets_collection=tf.get_collection(tf.GraphKeys.ASSET_FILEPATHS),
+        clear_devices=True)
+    b.save()
+    logging.info('Model saved at %s', output_dir)
