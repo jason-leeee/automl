@@ -251,6 +251,17 @@ class ModelInspector(object):
         if cv2.waitKey(1) & 0xFF == ord('q'):
           break
 
+  def saved_model_onnx(self, **kwargs):
+    """Export a saved model for inference."""
+    tf.enable_resource_variables()
+    driver = inference.ONNXDriver(
+        self.model_name,
+        self.ckpt_path,
+        batch_size=self.batch_size,
+        model_params=self.model_config.as_dict())
+    driver.build()
+    driver.export(self.saved_model_dir)
+
   def inference_single_image(self, image_image_path, output_dir, **kwargs):
     driver = inference.InferenceDriver(self.model_name, self.ckpt_path,
                                        self.model_config.as_dict())
@@ -449,7 +460,7 @@ class ModelInspector(object):
           kwargs['input_image'],
           trace_filename=kwargs.get('trace_filename', None))
     elif runmode in ('infer', 'saved_model', 'saved_model_infer',
-                     'saved_model_video'):
+                     'saved_model_video', 'saved_model_onnx'):
       config_dict = {}
       if kwargs.get('line_thickness', None):
         config_dict['line_thickness'] = kwargs.get('line_thickness')
@@ -469,6 +480,9 @@ class ModelInspector(object):
       elif runmode == 'saved_model_video':
         self.saved_model_video(kwargs['input_video'], kwargs['output_video'],
                                **config_dict)
+      elif runmode == 'saved_model_onnx':
+        self.saved_model_onnx(**config_dict)
+
     elif runmode == 'bm':
       self.benchmark_model(
           warmup_runs=5,
