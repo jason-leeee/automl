@@ -131,3 +131,7 @@ def restore_ckpt(model, ckpt_path_or_file, ema_decay=0.9998):
       except tf.errors.NotFoundError:
         logging.warning(f'Not found {key} in {ckpt_path_or_file}')
 
+def multi_apply(func, *args, **kwargs):
+    pfunc = partial(func, **kwargs) if kwargs else func
+    map_results = map(pfunc, *args)
+    return tuple(map(list, zip(*map_results)))
