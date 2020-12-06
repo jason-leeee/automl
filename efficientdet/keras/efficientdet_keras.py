@@ -684,7 +684,7 @@ class SOLOv2Head(tf.keras.layers.Layer):
                 base_edge_list=(16, 32, 64, 128, 256),
                 scale_ranges=((8, 32), (16, 64), (32, 128), (64, 256), (128, 512)),
                 sigma=0.2,
-                num_grids=None)
+                num_grids=None):
     super().__init__()
     self.num_classes = num_classes
     self.seg_num_grids = num_grids
@@ -782,6 +782,7 @@ class SOLOv2Head(tf.keras.layers.Layer):
     cate_pred, kernel_pred = multi_apply(self.forward_single, feats,
                                           list(range(len(self.seg_num_grids))),
                                           eval=eval)
+    return cate_pred, kernel_pred
 
   def single_target(self, gt_bboxes_raw,
                           gt_labels_raw,
