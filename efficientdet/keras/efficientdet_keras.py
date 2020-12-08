@@ -705,7 +705,7 @@ class SOLOv2Head(tf.keras.layers.Layer):
     self.cate_conv_bns = []
     self.kernel_convs = []
     self.kernel_conv_bns = []
-    for i in range(self.stacked_covs):
+    for i in range(self.stacked_convs):
       self.cate_convs.append(
         tf.keras.layers.Conv2D(
           num_filters,
@@ -740,20 +740,22 @@ class SOLOv2Head(tf.keras.layers.Layer):
             strategy=strategy,
             name='bn')
       )
-      self.solo_cate = tf.keras.layers.Conv2D(self.cate_num_filters, padding='same')
-      self.solo_kernel = tf.keras.layers.Conv2D(self.kernel_num_filters, padding='same')
+      self.solo_cate = tf.keras.layers.Conv2D(self.cate_num_filters, 3, padding='same')
+      self.solo_kernel = tf.keras.layers.Conv2D(self.kernel_num_filters, 3, padding='same')
 
   def call_single(self, ins_kernel_feat, idx, eval=False):
     """
     Args:
-      x: feature map of size ???? [B, H_i, W_i, C]
-      idx: i-th level feature map 
+      x: feature map of shape [B, H_i, W_i, C]
+      idx: a list of levels of feature maps
     """
     x_range = tf.linspace(-1, 1, ins_kernel_feat.shape[-2])
     y_range = tf.linspace(-1, 1, ins_kernel_feat.shape[-3])
     x, y = tf.meshgrid(x_range, y_range)
-    x = tf.broadcast_to(x, [ins_kernel_feat.shape[0], -1, -1, 1])
-    y = tf.broadcast_to(y, [ins_kernel_feat.shape[0], -1, -1, 1])
+    x = tf.cast(tf.broadcast_to(x, [ins_kernel_feat.shape[0], x.shape[0], x.shape[1]]), dtype=tf.float32)
+    y = tf.cast(tf.broadcast_to(y, [ins_kernel_feat.shape[0], y.shape[0], y.shape[1]]), dtype=tf.float32)
+    x = tf.expand_dims(x, -1)
+    y = tf.expand_dims(y, -1)
     coord_feat = tf.concat([x, y], -1)
     ins_kernel_feat = tf.concat([ins_kernel_feat, coord_feat], -1)
 
@@ -778,8 +780,9 @@ class SOLOv2Head(tf.keras.layers.Layer):
 
   def call(self, feats, eval=False):
     """"what is feats shape? a list of feats in this case"""
-    featmap_sizes = [featmap.size()[-2:] for featmap in feats]
-    cate_pred, kernel_pred = multi_apply(self.forward_single, feats,
+    #featmap_sizes = [featmap.shape[-2:] for featmap in feats]
+    #print("featmap_sizes: ", featmap_sizes)
+    cate_pred, kernel_pred = util_keras.multi_apply(self.call_single, feats,
                                           list(range(len(self.seg_num_grids))),
                                           eval=eval)
     return cate_pred, kernel_pred
