@@ -791,7 +791,7 @@ class SOLOv2Head(tf.keras.layers.Layer):
                           gt_labels_raw,
                           gt_masks_raw,
                           mask_feat_size):
-    gt_areas = torch.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
+    gt_areas = tf.math.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
                 gt_bboxes_raw[:, 3] - gt_bboxes_raw[:, 1]))
 
     ins_label_list = []
@@ -805,8 +805,8 @@ class SOLOv2Head(tf.keras.layers.Layer):
       num_ins = len(hit_indices)
       ins_label = []
       grid_order = []
-      cate_label = tf.zeros([num_grid, num_grid], dtype=tf.int64)
-      ins_ind_label = tf.zeros([num_grid ** 2], dtype=tf.bool)
+      cate_label = tf.zeros([num_grid, num_grid], dtype=tf.int64).numpy()
+      ins_ind_label = tf.zeros([num_grid ** 2], dtype=tf.bool).numpy()
       if num_ins == 0:
         ins_label = tf.zeros([0, mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8)
         ins_label_list.append(ins_label)
@@ -814,9 +814,9 @@ class SOLOv2Head(tf.keras.layers.Layer):
         ins_ind_label_list.append(ins_ind_label)
         grid_order_list.append([])
         continue
-      gt_bboxes = gt_bboxes_raw[hit_indices]
-      gt_labels = gt_labels_raw[hit_indices]
-      gt_masks = gt_masks_raw[hit_indices, ...]
+      gt_bboxes = tf.gather(gt_bboxes_raw, hit_indices)
+      gt_labels = tf.gather(gt_labels_raw, hit_indices)
+      gt_masks = tf.gather_nd(gt_masks_raw, hit_indices)
 
       half_ws = 0.5 * (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * self.sigma
       half_hs = 0.5 * (gt_bboxes[:, 3] - gt_bboxes[:, 1]) * self.sigma
@@ -824,12 +824,11 @@ class SOLOv2Head(tf.keras.layers.Layer):
       output_stride = 4
       img_scale = 1. / output_stride
       for seg_mask, gt_label, half_h, half_w in zip(gt_masks, gt_labels, half_hs, half_ws):
-        print(seg_mask.shape)
-        if seg_mask.sum() == 0:
+        if tf.keras.backend.sum(seg_mask) == 0:
             continue
         # mass center
         upsampled_size = (mask_feat_size[0] * 4, mask_feat_size[1] * 4)
-        center_h, center_w = ndimage.measurements.center_of_mass(seg_mask)
+        center_h, center_w = ndimage.measurements.center_of_mass(seg_mask.numpy())
         coord_w = int((center_w / upsampled_size[1]) // (1. / num_grid))
         coord_h = int((center_h / upsampled_size[0]) // (1. / num_grid))
 
@@ -846,14 +845,15 @@ class SOLOv2Head(tf.keras.layers.Layer):
 
         cate_label[top:(down+1), left:(right+1)] = gt_label
         new_w, new_h = int(seg_mask.shape[-2] * float(img_scale) + 0.5), int(seg_mask.shape[-1] * float(img_scale) + 0.5)
-        seg_mask = tf.image.resize(seg_mask, [new_w, new_h])
-      
+        # resize segmask to [batch, h, w, channel]
+        seg_mask = tf.image.resize(seg_mask[tf.newaxis, ..., tf.newaxis], [new_w, new_h])
         for i in range(top, down+1):
           for j in range(left, right+1):
             label = int(i * num_grid + j)
 
-            cur_ins_label = tf.zeros([mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8)
-            cur_ins_label[:seg_mask.shape[0], :seg_mask.shape[1]] = seg_mask
+            cur_ins_label = tf.zeros([mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8).numpy()
+            seg_mask_data = seg_mask.numpy
+            cur_ins_label[:seg_mask.shape[1], :seg_mask.shape[2]] = tf.squeeze(seg_mask)
             ins_label.append(cur_ins_label)
             ins_ind_label[label] = True
             grid_order.append(label)
