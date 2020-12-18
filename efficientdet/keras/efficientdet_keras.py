@@ -852,7 +852,6 @@ class SOLOv2Head(tf.keras.layers.Layer):
             label = int(i * num_grid + j)
 
             cur_ins_label = tf.zeros([mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8).numpy()
-            seg_mask_data = seg_mask.numpy
             cur_ins_label[:seg_mask.shape[1], :seg_mask.shape[2]] = tf.squeeze(seg_mask)
             ins_label.append(cur_ins_label)
             ins_ind_label[label] = True
