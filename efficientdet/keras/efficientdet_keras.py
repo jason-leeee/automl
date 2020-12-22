@@ -791,6 +791,13 @@ class SOLOv2Head(tf.keras.layers.Layer):
                           gt_labels_raw,
                           gt_masks_raw,
                           mask_feat_size):
+    """
+    Generate training targets for a single image.
+    Args:
+      gt_bboxes_raw: shape of [num_objects, 4]
+      gt_labels_raw: shape of [num_objects, 1]
+      gt_masks_raw: shape of [num_object, 1, H, W]
+    """                      
     gt_areas = tf.math.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
                 gt_bboxes_raw[:, 3] - gt_bboxes_raw[:, 1]))
 

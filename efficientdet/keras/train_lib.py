@@ -27,7 +27,7 @@ import utils
 from keras import anchors
 from keras import efficientdet_keras
 import neural_structured_learning as nsl
-
+from keras import util_keras
 from tensorflow_model_optimization.python.core.sparsity.keras import pruning_wrapper
 
 
@@ -527,14 +527,18 @@ class BoxIouLoss(tf.keras.losses.Loss):
 
 class SOLOLoss(tf.keras.losses.Loss):
   def __init__(self, ins_loss_weight, cate_out_channels, cfg, **kwargs):
+    """
+    Args:
+      ins_loss_weight: the weight between focal loss and dice loss
+    """
     super().__init__(**kwargs)
     self.cfg = cfg
     self.ins_loss_weight = ins_loss_weight
-    self.cate_out_channels = cate_out_channels
-
+    self.cate_out_channels = cate_out_channels - 1
+  
   def dice_loss(self, input, target):
     input = tf.reshape(input, [input.shape[0], -1])
-    target = tf.reshape(target, [target.shape[0], -1]).float()
+    target = tf.cast(tf.reshape(target, [target.shape[0], -1]), tf.float32)
 
     a = tf.keras.backend.sum(input * target, 1)
     b = tf.keras.backend.sum(input * input, 1) + 0.001
@@ -543,83 +547,110 @@ class SOLOLoss(tf.keras.losses.Loss):
     return 1-d
 
   @tf.autograph.experimental.do_not_convert  
-  def call(self, cate_preds, kernel_preds, ins_pred, gt_bbox_list,
-            gt_label_list, gt_mask_list):
-    mask_feat_size = ins_pred.size()[-2:]
-    ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list = multi_apply(
-                                                                            self.solov2_target_single,
+  def call(self, y_true, y_preds):
+    head, cate_preds, kernel_preds, ins_pred = y_preds
+    gt_bbox_list, gt_label_list, gt_mask_list = y_true
+    mask_feat_size = ins_pred.shape[:-1]
+    print("mask_feat_size:", mask_feat_size)
+    ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list = util_keras.multi_apply(
+                                                                            head.single_target,
                                                                             gt_bbox_list,
                                                                             gt_label_list,
                                                                             gt_mask_list, 
                                                                             mask_feat_size=mask_feat_size)
     # ins
-    ins_labels = [tf.stack([ins_labels_level_img
+    ins_labels = [tf.concat([ins_labels_level_img
                             for ins_labels_level_img in ins_labels_level], 0)
                   for ins_labels_level in zip(*ins_label_list)]
 
-    kernel_preds = [[tf.reshape(kernel_preds_level_img, kernel_preds_level_img.shape[0], -1)[:, grid_orders_level_img]
-                      for kernel_preds_level_img, grid_orders_level_img in
-                      zip(kernel_preds_level, grid_orders_level)]
-                    for kernel_preds_level, grid_orders_level in zip(kernel_preds, zip(*grid_order_list))]
+    print("oders", grid_order_list)
+
+    kernel_preds_list = []
+    for kernel_preds_level, grid_orders_level in zip(kernel_preds, zip(*grid_order_list)):
+      kernel_preds_level_list = []
+      for kernel_preds_level_img, grid_orders_level_img in zip(kernel_preds_level, grid_orders_level):
+        print(kernel_preds_level_img.shape) 
+        #print(grid_orders_level_img)
+        kernel_preds_level_img = tf.reshape(kernel_preds_level_img, [-1, kernel_preds_level_img.shape[-1]])
+        print("kernel_preds_level_img shape:", kernel_preds_level_img.shape)
+        grid_orders_level_img = tf.convert_to_tensor(grid_orders_level_img, dtype=tf.int32)
+        #print(grid_orders_level_img)
+        kernel_preds_level_list.append(tf.gather(kernel_preds_level_img, grid_orders_level_img))
+        #print("hello there:", kernel_preds_level)
+
+      kernel_preds_list.append(kernel_preds_level_list)
+                 
     # generate masks
     ins_pred = ins_pred
     ins_pred_list = []
-    for b_kernel_pred in kernel_preds:
+    for b_kernel_pred in kernel_preds_list:
       b_mask_pred = []
       for idx, kernel_pred in enumerate(b_kernel_pred):
-
-        if kernel_pred.size()[-1] == 0:
+        print("kernel_pred shape:", kernel_pred.shape)
+        if kernel_pred.shape[0] == 0:
           continue
-        cur_ins_pred = ins_pred[idx, ...]
+        cur_ins_pred = ins_pred[..., idx]
+        print("cur_ins_pred:", idx, cur_ins_pred.shape)
         H, W = cur_ins_pred.shape[-2:]
         N, I = kernel_pred.shape
-        cur_ins_pred = tf.expand_dims(cur_ins_pred, 0)
-        kernel_pred = tf.reshape(tf.transposse(kernel_pred, perm=[1, 0]), [I, -1, 1, 1])
-        cur_ins_pred = tf.nn.conv2d(cur_ins_pred, kernel_pred, strides=1).reshape(-1, H, W)
+        print(H, W, N, I)
+        cur_ins_pred = cur_ins_pred[tf.newaxis, ..., tf.newaxis]
+        kernel_pred = tf.reshape(tf.transpose(kernel_pred, perm=[1, 0]), [I, -1, 1, 1])
+        cur_ins_pred = tf.reshape(tf.nn.conv2d(cur_ins_pred, kernel_pred, strides=1, padding='SAME'), [-1, H, W])
         b_mask_pred.append(cur_ins_pred)
+        print("transposed kernel_pred shape:", kernel_pred.shape)
+        print("convolved cur_ins_pred shape:", cur_ins_pred.shape)
       if len(b_mask_pred) == 0:
           b_mask_pred = None
       else:
-          b_mask_pred = tf.stack(b_mask_pred, 0)
+          b_mask_pred = tf.concat(b_mask_pred, 0)
       ins_pred_list.append(b_mask_pred)
-    
+
+    print("check ins_ind labels shape", ins_ind_label_list[0][0].shape)  
+ 
     ins_ind_labels = [
-            tf.stack([tf.keras.backend.flatten(ins_ind_labels_level_img)
+            tf.concat([tf.keras.backend.flatten(ins_ind_labels_level_img)
                        for ins_ind_labels_level_img in ins_ind_labels_level], 0)
             for ins_ind_labels_level in zip(*ins_ind_label_list)
         ]
+    #print(ins_ind_labels)
+    flatten_ins_ind_labels = tf.concat(ins_ind_labels, 0)
+ 
+    num_ins = tf.math.reduce_sum(tf.cast(flatten_ins_ind_labels, dtype=tf.uint8))
     
-    flatten_ins_ind_labels = tf.stack(ins_ind_labels)
-
-    num_ins = flatten_ins_ind_labels.sum()
-
     # dice loss
     loss_ins = []
     for input, target in zip(ins_pred_list, ins_labels):
       if input is None:
         continue
       input = tf.keras.activations.sigmoid(input)
-      loss_ins.append(dice_loss(input, target))
-    loss_ins = tf.stack(loss_ins).mean()
+      loss_ins.append(self.dice_loss(input, target))
+    loss_ins = tf.math.reduce_mean(tf.stack(loss_ins))
     loss_ins = loss_ins * self.ins_loss_weight
+    print("loss_ins:", loss_ins)
 
     # cate
     cate_labels = [
-        tf.stack([tf.keras.backend.flatten(cate_labels_level_img)
-                    for cate_labels_level_img in cate_labels_level])
+        tf.concat([tf.keras.backend.flatten(cate_labels_level_img)
+                    for cate_labels_level_img in cate_labels_level], axis=0)
         for cate_labels_level in zip(*cate_label_list)
     ]
-    flatten_cate_labels = tf.stack(cate_labels)
+    print("cate_label shape", cate_labels[0].shape)
+    flatten_cate_labels = tf.concat(cate_labels, axis=0)
+    print("flattened cate_label shape", cate_labels[0].shape)
 
+    for cate_pred in cate_preds:
+      print("cate_pred shape", cate_pred.shape)
     cate_preds = [tf.reshape(tf.transpose(cate_pred, perm=[0, 2, 3, 1]), [-1, self.cate_out_channels])
         for cate_pred in cate_preds
     ]
-    flatten_cate_preds = tf.stack(cate_preds)
-    """what is loss_cate?"""
-    loss_cate = self.loss_cate(flatten_cate_preds, flatten_cate_labels, avg_factor=num_ins + 1)
-    return dict(
-        loss_ins=loss_ins,
-        loss_cate=loss_cate)
+    flatten_cate_preds = tf.concat(cate_preds, axis=0)
+
+    return loss_ins
+    #loss_cate = self.loss_cate(flatten_cate_preds, flatten_cate_labels, avg_factor=num_ins + 1)
+    #return dict(
+    #    loss_ins=loss_ins,
+    #    loss_cate=loss_cate)
 
 
 class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
