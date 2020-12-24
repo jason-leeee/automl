@@ -20,7 +20,7 @@ import re
 from absl import logging
 import numpy as np
 import tensorflow as tf
-
+from scipy import ndimage
 import inference
 import iou_utils
 import utils
@@ -526,15 +526,24 @@ class BoxIouLoss(tf.keras.losses.Loss):
 
 
 class SOLOLoss(tf.keras.losses.Loss):
-  def __init__(self, ins_loss_weight, cate_out_channels, cfg, **kwargs):
+  def __init__(self, ins_loss_weight, 
+                cate_out_channels, cfg, 
+                strides=(4, 8, 16, 32, 64),
+                scale_ranges=((8, 32), (16, 64), (32, 128), (64, 256), (128, 512)),
+                sigma = 0.2,
+                num_grids=None):
     """
     Args:
       ins_loss_weight: the weight between focal loss and dice loss
     """
-    super().__init__(**kwargs)
+    super().__init__()
+    self.scale_ranges = scale_ranges
+    self.strides = strides
+    self.seg_num_grids = num_grids
     self.cfg = cfg
     self.ins_loss_weight = ins_loss_weight
     self.cate_out_channels = cate_out_channels - 1
+    self.sigma = sigma
   
   def dice_loss(self, input, target):
     input = tf.reshape(input, [input.shape[0], -1])
@@ -546,14 +555,99 @@ class SOLOLoss(tf.keras.losses.Loss):
     d = (2 * a) / (b + c)
     return 1-d
 
+  def single_target(self, gt_bboxes_raw,
+                          gt_labels_raw,
+                          gt_masks_raw,
+                          mask_feat_size):
+    """
+    Generate training targets for a single image.
+    Args:
+      gt_bboxes_raw: shape of [num_objects, 4]
+      gt_labels_raw: shape of [num_objects, 1]
+      gt_masks_raw: shape of [num_object, 1, H, W]
+    """                      
+    gt_areas = tf.math.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
+                gt_bboxes_raw[:, 3] - gt_bboxes_raw[:, 1]))
+
+    ins_label_list = []
+    cate_label_list = []
+    ins_ind_label_list = []
+    grid_order_list = []
+
+    for (lower_bound, upper_bound), stride, num_grid \
+          in zip(self.scale_ranges, self.strides, self.seg_num_grids):
+      hit_indices = tf.keras.backend.flatten(tf.where(((gt_areas >= lower_bound) and (gt_areas <= upper_bound))))
+      num_ins = len(hit_indices)
+      ins_label = []
+      grid_order = []
+      cate_label = tf.zeros([num_grid, num_grid], dtype=tf.int64).numpy()
+      ins_ind_label = tf.zeros([num_grid ** 2], dtype=tf.bool).numpy()
+      if num_ins == 0:
+        ins_label = tf.zeros([0, mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8)
+        ins_label_list.append(ins_label)
+        cate_label_list.append(cate_label)
+        ins_ind_label_list.append(ins_ind_label)
+        grid_order_list.append([])
+        continue
+      gt_bboxes = tf.gather(gt_bboxes_raw, hit_indices)
+      gt_labels = tf.gather(gt_labels_raw, hit_indices)
+      gt_masks = tf.gather_nd(gt_masks_raw, hit_indices)
+
+      half_ws = 0.5 * (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * self.sigma
+      half_hs = 0.5 * (gt_bboxes[:, 3] - gt_bboxes[:, 1]) * self.sigma
+
+      output_stride = 4
+      img_scale = 1. / output_stride
+      for seg_mask, gt_label, half_h, half_w in zip(gt_masks, gt_labels, half_hs, half_ws):
+        if tf.keras.backend.sum(seg_mask) == 0:
+            continue
+        # mass center
+        upsampled_size = (mask_feat_size[0] * 4, mask_feat_size[1] * 4)
+        center_h, center_w = ndimage.measurements.center_of_mass(seg_mask.numpy())
+        coord_w = int((center_w / upsampled_size[1]) // (1. / num_grid))
+        coord_h = int((center_h / upsampled_size[0]) // (1. / num_grid))
+
+        # left, top, right, down
+        top_box = max(0, int(((center_h - half_h) / upsampled_size[0]) // (1. / num_grid)))
+        down_box = min(num_grid - 1, int(((center_h + half_h) / upsampled_size[0]) // (1. / num_grid)))
+        left_box = max(0, int(((center_w - half_w) / upsampled_size[1]) // (1. / num_grid)))
+        right_box = min(num_grid - 1, int(((center_w + half_w) / upsampled_size[1]) // (1. / num_grid)))
+
+        top = max(top_box, coord_h-1)
+        down = min(down_box, coord_h+1)
+        left = max(coord_w-1, left_box)
+        right = min(right_box, coord_w+1)
+
+        cate_label[top:(down+1), left:(right+1)] = gt_label
+        new_w, new_h = int(seg_mask.shape[-2] * float(img_scale) + 0.5), int(seg_mask.shape[-1] * float(img_scale) + 0.5)
+        # resize segmask to [batch, h, w, channel]
+        seg_mask = tf.image.resize(seg_mask[tf.newaxis, ..., tf.newaxis], [new_w, new_h])
+        for i in range(top, down+1):
+          for j in range(left, right+1):
+            label = int(i * num_grid + j)
+
+            cur_ins_label = tf.zeros([mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8).numpy()
+            cur_ins_label[:seg_mask.shape[1], :seg_mask.shape[2]] = tf.squeeze(seg_mask)
+            ins_label.append(cur_ins_label)
+            ins_ind_label[label] = True
+            grid_order.append(label)
+      
+      ins_label = tf.stack(ins_label, 0)
+
+      ins_label_list.append(ins_label)
+      cate_label_list.append(cate_label)
+      ins_ind_label_list.append(ins_ind_label)
+      grid_order_list.append(grid_order)
+    return ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list
+
   @tf.autograph.experimental.do_not_convert  
   def call(self, y_true, y_preds):
-    head, cate_preds, kernel_preds, ins_pred = y_preds
+    cate_preds, kernel_preds, ins_pred = y_preds
     gt_bbox_list, gt_label_list, gt_mask_list = y_true
     mask_feat_size = ins_pred.shape[:-1]
     print("mask_feat_size:", mask_feat_size)
     ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list = util_keras.multi_apply(
-                                                                            head.single_target,
+                                                                            self.single_target,
                                                                             gt_bbox_list,
                                                                             gt_label_list,
                                                                             gt_mask_list, 
@@ -594,8 +688,8 @@ class SOLOLoss(tf.keras.losses.Loss):
         H, W = cur_ins_pred.shape[-2:]
         N, I = kernel_pred.shape
         print(H, W, N, I)
-        cur_ins_pred = cur_ins_pred[tf.newaxis, ..., tf.newaxis]
-        kernel_pred = tf.reshape(tf.transpose(kernel_pred, perm=[1, 0]), [I, -1, 1, 1])
+        cur_ins_pred = cur_ins_pred[tf.newaxis, ..., tf.newaxis] #shape [B, H, W, C]
+        kernel_pred = tf.reshape(kernel_pred, [1, 1, -1, I]) #shape [H, W, in, out]
         cur_ins_pred = tf.reshape(tf.nn.conv2d(cur_ins_pred, kernel_pred, strides=1, padding='SAME'), [-1, H, W])
         b_mask_pred.append(cur_ins_pred)
         print("transposed kernel_pred shape:", kernel_pred.shape)
@@ -641,7 +735,7 @@ class SOLOLoss(tf.keras.losses.Loss):
 
     for cate_pred in cate_preds:
       print("cate_pred shape", cate_pred.shape)
-    cate_preds = [tf.reshape(tf.transpose(cate_pred, perm=[0, 2, 3, 1]), [-1, self.cate_out_channels])
+    cate_preds = [tf.reshape(cate_pred, [-1, self.cate_out_channels])
         for cate_pred in cate_preds
     ]
     flatten_cate_preds = tf.concat(cate_preds, axis=0)

@@ -27,7 +27,6 @@ from keras import fpn_configs
 from keras import postprocess
 from keras import util_keras
 from keras import tfmot
-from scipy import ndimage
 # pylint: disable=arguments-differ  # fo keras layers.
 
 
@@ -682,8 +681,6 @@ class SOLOv2Head(tf.keras.layers.Layer):
                 stacked_convs=4,
                 strides=(4, 8, 16, 32, 64),
                 base_edge_list=(16, 32, 64, 128, 256),
-                scale_ranges=((8, 32), (16, 64), (32, 128), (64, 256), (128, 512)),
-                sigma=0.2,
                 num_grids=None):
     super().__init__()
     self.num_classes = num_classes
@@ -694,11 +691,9 @@ class SOLOv2Head(tf.keras.layers.Layer):
     #self.seg_feat_channels = seg_feat_channels
     self.stacked_convs = stacked_convs
     self.strides = strides
-    self.sigma = sigma
     self.stacked_convs = stacked_convs
     #self.kernel_out_channels = self.ins_out_channels * 1 * 1
-    self.base_edge_list = base_edge_list
-    self.scale_ranges = scale_ranges
+    #self.base_edge_list = base_edge_list
     self.cate_num_filters = self.num_classes - 1
     self.kernel_num_filters = num_filters * 3 * 3
     self.cate_convs = []
@@ -786,91 +781,6 @@ class SOLOv2Head(tf.keras.layers.Layer):
                                           list(range(len(self.seg_num_grids))),
                                           eval=eval)
     return cate_pred, kernel_pred
-
-  def single_target(self, gt_bboxes_raw,
-                          gt_labels_raw,
-                          gt_masks_raw,
-                          mask_feat_size):
-    """
-    Generate training targets for a single image.
-    Args:
-      gt_bboxes_raw: shape of [num_objects, 4]
-      gt_labels_raw: shape of [num_objects, 1]
-      gt_masks_raw: shape of [num_object, 1, H, W]
-    """                      
-    gt_areas = tf.math.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
-                gt_bboxes_raw[:, 3] - gt_bboxes_raw[:, 1]))
-
-    ins_label_list = []
-    cate_label_list = []
-    ins_ind_label_list = []
-    grid_order_list = []
-
-    for (lower_bound, upper_bound), stride, num_grid \
-          in zip(self.scale_ranges, self.strides, self.seg_num_grids):
-      hit_indices = tf.keras.backend.flatten(tf.where(((gt_areas >= lower_bound) and (gt_areas <= upper_bound))))
-      num_ins = len(hit_indices)
-      ins_label = []
-      grid_order = []
-      cate_label = tf.zeros([num_grid, num_grid], dtype=tf.int64).numpy()
-      ins_ind_label = tf.zeros([num_grid ** 2], dtype=tf.bool).numpy()
-      if num_ins == 0:
-        ins_label = tf.zeros([0, mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8)
-        ins_label_list.append(ins_label)
-        cate_label_list.append(cate_label)
-        ins_ind_label_list.append(ins_ind_label)
-        grid_order_list.append([])
-        continue
-      gt_bboxes = tf.gather(gt_bboxes_raw, hit_indices)
-      gt_labels = tf.gather(gt_labels_raw, hit_indices)
-      gt_masks = tf.gather_nd(gt_masks_raw, hit_indices)
-
-      half_ws = 0.5 * (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * self.sigma
-      half_hs = 0.5 * (gt_bboxes[:, 3] - gt_bboxes[:, 1]) * self.sigma
-
-      output_stride = 4
-      img_scale = 1. / output_stride
-      for seg_mask, gt_label, half_h, half_w in zip(gt_masks, gt_labels, half_hs, half_ws):
-        if tf.keras.backend.sum(seg_mask) == 0:
-            continue
-        # mass center
-        upsampled_size = (mask_feat_size[0] * 4, mask_feat_size[1] * 4)
-        center_h, center_w = ndimage.measurements.center_of_mass(seg_mask.numpy())
-        coord_w = int((center_w / upsampled_size[1]) // (1. / num_grid))
-        coord_h = int((center_h / upsampled_size[0]) // (1. / num_grid))
-
-        # left, top, right, down
-        top_box = max(0, int(((center_h - half_h) / upsampled_size[0]) // (1. / num_grid)))
-        down_box = min(num_grid - 1, int(((center_h + half_h) / upsampled_size[0]) // (1. / num_grid)))
-        left_box = max(0, int(((center_w - half_w) / upsampled_size[1]) // (1. / num_grid)))
-        right_box = min(num_grid - 1, int(((center_w + half_w) / upsampled_size[1]) // (1. / num_grid)))
-
-        top = max(top_box, coord_h-1)
-        down = min(down_box, coord_h+1)
-        left = max(coord_w-1, left_box)
-        right = min(right_box, coord_w+1)
-
-        cate_label[top:(down+1), left:(right+1)] = gt_label
-        new_w, new_h = int(seg_mask.shape[-2] * float(img_scale) + 0.5), int(seg_mask.shape[-1] * float(img_scale) + 0.5)
-        # resize segmask to [batch, h, w, channel]
-        seg_mask = tf.image.resize(seg_mask[tf.newaxis, ..., tf.newaxis], [new_w, new_h])
-        for i in range(top, down+1):
-          for j in range(left, right+1):
-            label = int(i * num_grid + j)
-
-            cur_ins_label = tf.zeros([mask_feat_size[0], mask_feat_size[1]], dtype=tf.uint8).numpy()
-            cur_ins_label[:seg_mask.shape[1], :seg_mask.shape[2]] = tf.squeeze(seg_mask)
-            ins_label.append(cur_ins_label)
-            ins_ind_label[label] = True
-            grid_order.append(label)
-      
-      ins_label = tf.stack(ins_label, 0)
-
-      ins_label_list.append(ins_label)
-      cate_label_list.append(cate_label)
-      ins_ind_label_list.append(ins_ind_label)
-      grid_order_list.append(grid_order)
-    return ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list
 
   def get_seg_single(self,
                       cate_preds,
