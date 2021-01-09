@@ -65,6 +65,7 @@ FLAGS = flags.FLAGS
 
 def create_tf_example(image,
                       image_dir,
+                      use_solo=False,
                       bbox_annotations=None,
                       category_index=None,
                       caption_annotations=None,
@@ -146,10 +147,16 @@ def create_tf_example(image,
       if x + width > image_width or y + height > image_height:
         num_annotations_skipped += 1
         continue
-      xmin.append(float(x) / image_width)
-      xmax.append(float(x + width) / image_width)
-      ymin.append(float(y) / image_height)
-      ymax.append(float(y + height) / image_height)
+      if not use_solo:
+        xmin.append(float(x) / image_width)
+        xmax.append(float(x + width) / image_width)
+        ymin.append(float(y) / image_height)
+        ymax.append(float(y + height) / image_height)
+      else:
+        xmin.append(float(x))
+        xmax.append(float(x + width))
+        ymin.append(float(y))
+        ymax.append(float(y + height))
       is_crowd.append(object_annotations['iscrowd'])
       category_id = int(object_annotations['category_id'])
       category_ids.append(category_id)
