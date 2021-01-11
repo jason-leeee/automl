@@ -574,6 +574,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     ins_ind_label_list = []
     grid_order_list = []
 
+
     for (lower_bound, upper_bound), stride, num_grid \
           in zip(self.scale_ranges, self.strides, self.seg_num_grids):
       hit_indices = tf.keras.backend.flatten(tf.where(((gt_areas >= lower_bound) and (gt_areas <= upper_bound))))
@@ -724,6 +725,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     print("loss_ins:", loss_ins)
 
     # cate
+  
     cate_labels = [
         tf.concat([tf.keras.backend.flatten(cate_labels_level_img)
                     for cate_labels_level_img in cate_labels_level], axis=0)
@@ -739,13 +741,17 @@ class SOLOLoss(tf.keras.losses.Loss):
         for cate_pred in cate_preds
     ]
     flatten_cate_preds = tf.concat(cate_preds, axis=0)
+    print(len(flatten_cate_labels), len(flatten_cate_preds))
 
     return loss_ins
+
     #loss_cate = self.loss_cate(flatten_cate_preds, flatten_cate_labels, avg_factor=num_ins + 1)
     #return dict(
     #    loss_ins=loss_ins,
     #    loss_cate=loss_cate)
 
+  def get_loss_weight(self):
+    return self.ins_loss_weight
 
 class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
   """A customized trainer for EfficientDet.
@@ -774,6 +780,25 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
         if var_match.match(v.name)
     ])
 
+  def _solo_loss(self, cate_preds, kernel_preds, ins_pred, labels, loss_vals):
+    # labels = {}
+    precision = utils.get_precision(self.config.strategy, self.config.mixed_precision)
+    dtype = precision.split('_')[-1]
+    cls_losses = []
+  
+    solo_loss_layer = self.loss.get(SOLOLoss.__name__, None)
+    solo_loss, cate_label_list, cate_preds, normalizer = solo_loss_layer([cate_preds, kernel_preds, ins_pred],
+                                [lables['gt_bbox_list'], labels['gt_label_list'], ['gt_mask_list']])
+    ins_loss_weight = solo_loss_layer.get_loss_weight()                            
+    levels = len(cate_label_list)
+    for level in levels:
+      cls_loss_layer = self.loss.get(FocalLoss.__name, None)
+      cls_loss = cls_loss_layer([normalizer,cate_label_list], cate_preds)
+      cls_losses.append(tf.cast(cls_loss_sum, dtype))
+    cls_loss = tf.math.add_n(cls_losses) if cls_losses else 0  
+    totol_loss = solo_loss + ins_loss_weight * cls_losses  
+    return total_loss
+         
   def _detection_loss(self, cls_outputs, box_outputs, labels, loss_vals):
     """Computes total detection loss.
 
