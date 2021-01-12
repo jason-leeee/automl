@@ -26,8 +26,9 @@ class MaskFeatHead(tf.keras.layers.Layer):
 
         self.all_level_convs = []
         for i in range(start_level, end_level + 1):
+            assert start_level >= 2, "minimum start level should be at least 2!"
             level_convs = tf.keras.Sequential()
-            if i == 0:
+            if i == 2:
                 
                 level_convs.add(
                     tf.keras.layers.Conv2D(
