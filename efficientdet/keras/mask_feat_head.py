@@ -6,7 +6,6 @@ class MaskFeatHead(tf.keras.layers.Layer):
     def __init__(self,
                 num_classes,
                 in_channels,
-                level_sizes,
                 out_channels,
                 is_training_bn,
                 batch_size,
