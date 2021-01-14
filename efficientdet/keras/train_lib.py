@@ -530,8 +530,12 @@ class SOLOLoss(tf.keras.losses.Loss):
                 cate_out_channels, cfg, 
                 strides=(4, 8, 16, 32, 64),
                 scale_ranges=((8, 32), (16, 64), (32, 128), (64, 256), (128, 512)),
-                sigma = 0.2,
-                num_grids=None):
+                sigma=0.2,
+                alpha=0.25,
+                gamma=1.5,
+                label_smoothing=0.1,
+                num_grids=None,
+                dtype=None):
     """
     Args:
       ins_loss_weight: the weight between focal loss and dice loss
@@ -544,8 +548,16 @@ class SOLOLoss(tf.keras.losses.Loss):
     self.ins_loss_weight = ins_loss_weight
     self.cate_out_channels = cate_out_channels - 1
     self.sigma = sigma
+    self.gamma = gamma
+    self.alpha = alpha
+    self.label_smoothing = label_smoothing
+    self.dtype = dtype
+
+  def set_dtype(self, dtype):
+    self.dtype = dtype  
   
-  def dice_loss(self, input, target):
+  @tf.autograph.experimental.do_not_convert
+  def call(self, input, target):
     input = tf.reshape(input, [input.shape[0], -1])
     target = tf.cast(tf.reshape(target, [target.shape[0], -1]), tf.float32)
 
@@ -553,7 +565,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     b = tf.keras.backend.sum(input * input, 1) + 0.001
     c = tf.keras.backend.sum(target * target, 1) + 0.001
     d = (2 * a) / (b + c)
-    return 1-d
+    return 1-d  
 
   def single_target(self, gt_bboxes_raw,
                           gt_labels_raw,
@@ -641,10 +653,7 @@ class SOLOLoss(tf.keras.losses.Loss):
       grid_order_list.append(grid_order)
     return ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list
 
-  @tf.autograph.experimental.do_not_convert  
-  def call(self, y_true, y_preds):
-    cate_preds, kernel_preds, ins_pred = y_preds
-    gt_bbox_list, gt_label_list, gt_mask_list = y_true
+  def generate_targets(self, kernel_preds, ins_pred, gt_bbox_list, gt_label_list, gt_mask_list):
     mask_feat_size = ins_pred.shape[:-1]
     print("mask_feat_size:", mask_feat_size)
     ins_label_list, cate_label_list, ins_ind_label_list, grid_order_list = util_keras.multi_apply(
@@ -712,43 +721,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     flatten_ins_ind_labels = tf.concat(ins_ind_labels, 0)
  
     num_ins = tf.math.reduce_sum(tf.cast(flatten_ins_ind_labels, dtype=tf.uint8))
-    
-    # dice loss
-    loss_ins = []
-    for input, target in zip(ins_pred_list, ins_labels):
-      if input is None:
-        continue
-      input = tf.keras.activations.sigmoid(input)
-      loss_ins.append(self.dice_loss(input, target))
-    loss_ins = tf.math.reduce_mean(tf.stack(loss_ins))
-    loss_ins = loss_ins * self.ins_loss_weight
-    print("loss_ins:", loss_ins)
-
-    # cate
-  
-    cate_labels = [
-        tf.concat([tf.keras.backend.flatten(cate_labels_level_img)
-                    for cate_labels_level_img in cate_labels_level], axis=0)
-        for cate_labels_level in zip(*cate_label_list)
-    ]
-    print("cate_label shape", cate_labels[0].shape)
-    flatten_cate_labels = tf.concat(cate_labels, axis=0)
-    print("flattened cate_label shape", cate_labels[0].shape)
-
-    for cate_pred in cate_preds:
-      print("cate_pred shape", cate_pred.shape)
-    cate_preds = [tf.reshape(cate_pred, [-1, self.cate_out_channels])
-        for cate_pred in cate_preds
-    ]
-    flatten_cate_preds = tf.concat(cate_preds, axis=0)
-    print(len(flatten_cate_labels), len(flatten_cate_preds))
-
-    return loss_ins
-
-    #loss_cate = self.loss_cate(flatten_cate_preds, flatten_cate_labels, avg_factor=num_ins + 1)
-    #return dict(
-    #    loss_ins=loss_ins,
-    #    loss_cate=loss_cate)
+    return ins_pred_list, ins_labels, cate_label_list, num_ins   
 
   def get_loss_weight(self):
     return self.ins_loss_weight
@@ -780,24 +753,75 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
         if var_match.match(v.name)
     ])
 
-  def _solo_loss(self, cate_preds, kernel_preds, ins_pred, labels, loss_vals):
-    # labels = {}
+  def _solo_loss(self, cate_preds, kernel_preds, ins_pred, labels):
+    """Computes total detection loss.
+
+    Computes total detection loss including box and class loss from all levels.
+    Args:
+      cls_outputs: an OrderDict with keys representing levels and values
+        representing logits in [batch_size, height, width, num_anchors].
+      box_outputs: an OrderDict with keys representing levels and values
+        representing box regression targets in [batch_size, height, width,
+        num_anchors * 4].
+      labels: the dictionary that returned from dataloader that includes
+        groundtruth targets.
+      loss_vals: A dict of loss values.
+
+    Returns:
+      total_loss: an integer tensor representing total loss reducing from
+        class and box losses from all levels.
+      cls_loss: an integer tensor representing total class loss.
+      box_loss: an integer tensor representing total box regression loss.
+      box_iou_loss: an integer tensor representing total box iou loss.
+    """
     precision = utils.get_precision(self.config.strategy, self.config.mixed_precision)
     dtype = precision.split('_')[-1]
-    cls_losses = []
-  
-    solo_loss_layer = self.loss.get(SOLOLoss.__name__, None)
-    solo_loss, cate_label_list, cate_preds, normalizer = solo_loss_layer([cate_preds, kernel_preds, ins_pred],
-                                [lables['gt_bbox_list'], labels['gt_label_list'], ['gt_mask_list']])
-    ins_loss_weight = solo_loss_layer.get_loss_weight()                            
-    levels = len(cate_label_list)
-    for level in levels:
-      cls_loss_layer = self.loss.get(FocalLoss.__name, None)
-      cls_loss = cls_loss_layer([normalizer,cate_label_list], cate_preds)
-      cls_losses.append(tf.cast(cls_loss_sum, dtype))
-    cls_loss = tf.math.add_n(cls_losses) if cls_losses else 0  
-    totol_loss = solo_loss + ins_loss_weight * cls_losses  
-    return total_loss
+ 
+    
+    gt_bbox_list = labels['gt_bbox_list'].to_list()
+    gt_label_list = labels['gt_label_list'].to_list()
+    gt_mask_list = labels['gt_mask_list'].to_list()
+
+    y_preds = (cate_preds, kernel_preds, ins_pred)
+    y_true = (gt_bbox_list, gt_label_list, gt_mask_list)
+    # Data format is channels_last [B, H, W, C]
+    class_loss_layer = self.loss.get(SOLOLoss.__name__, None)
+    class_loss_layer.set_dtype(dtype)
+    ins_pred_list, ins_labels, cate_label_list, num_ins = class_loss_layer.generate_targets(ins_pred,
+                                                                                            gt_bbox_list,
+                                                                                            gt_label_list,
+                                                                                            gt_mask_list)
+    if class_loss_layer:
+      loss_ins = []
+      for input, target in zip(ins_pred_list, ins_labels):
+        if input is None:
+          continue
+        input = tf.keras.activations.sigmoid(input)
+        loss_ins.append(class_loss_layer(input, target))
+      loss_ins = tf.math.reduce_mean(tf.stack(loss_ins))
+      ins_loss_weight = class_loss_layer.get_loss_weight()
+      loss_ins = loss_ins * ins_loss_weight
+      print("loss_ins:", loss_ins)
+    
+    # cate_preds have shape [num_levels * [B, S, S, num_classes]] 
+    # cate_label_list has shape [B * [num_levels * [S, S]]]
+    level_cate_labels = zip(*cate_label_list) 
+    cate_loss_layer = self.loss.get(FocalLoss.__name__, None)
+    cate_losses = []
+    for input, y in zip(cate_preds, level_cate_labels):
+      if input is None:
+        continue     
+      y = tf.cast(tf.one_hot(y, input.shape[-1]), input.dtype)
+      num_ins = tf.cast(num_ins, input.dtype)
+      assert y.shape == input.shape, "Inconsistant shapes!"
+      y = (num_ins, y)
+      cls_loss = self.focal_loss(input, y)
+      cls_loss_sum = tf.clip_by_value(tf.math.reduce_sum(cls_loss), 0.0, 2.0)
+      cate_losses.append(tf.cast(cls_loss_sum, dtype))
+    cate_losses = tf.add_n(cate_losses) if cate_losses else 0
+    return dict(solo_loss=loss_ins, 
+                cate_loss=cate_losses)
+
          
   def _detection_loss(self, cls_outputs, box_outputs, labels, loss_vals):
     """Computes total detection loss.
@@ -927,56 +951,97 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       A dict record loss info.
     """
     images, labels = data
+    # assume the config file contains a term called "use_solo"
     if self.config.img_summary_steps:
       with self.summary_writer.as_default():
         tf.summary.image('input_image', images)
-    with tf.GradientTape() as tape:
-      if len(self.config.heads) == 2:
-        cls_outputs, box_outputs, seg_outputs = self(images, training=True)
-      elif 'object_detection' in self.config.heads:
-        cls_outputs, box_outputs = self(images, training=True)
-      elif 'segmentation' in self.config.heads:
-        seg_outputs, = self(images, training=True)
-      total_loss = 0
-      loss_vals = {}
-      if 'object_detection' in self.config.heads:
-        det_loss = self._detection_loss(cls_outputs, box_outputs, labels,
-                                        loss_vals)
-        total_loss += det_loss
-      if 'segmentation' in self.config.heads:
-        seg_loss_layer = (
-            self.loss[tf.keras.losses.SparseCategoricalCrossentropy.__name__])
-        seg_loss = seg_loss_layer(labels['image_masks'], seg_outputs)
-        total_loss += seg_loss
-        loss_vals['seg_loss'] = seg_loss
+    if not self.config.use_solo:
+      with tf.GradientTape() as tape:
+        if len(self.config.heads) == 2:
+          cls_outputs, box_outputs, seg_outputs = self(images, training=True)
+        elif 'object_detection' in self.config.heads:
+          cls_outputs, box_outputs = self(images, training=True)
+        elif 'segmentation' in self.config.heads:
+          seg_outputs, = self(images, training=True)
+        total_loss = 0
+        loss_vals = {}
+        if 'object_detection' in self.config.heads:
+          det_loss = self._detection_loss(cls_outputs, box_outputs, labels,
+                                          loss_vals)
+          total_loss += det_loss
+        if 'segmentation' in self.config.heads:
+          seg_loss_layer = (
+              self.loss[tf.keras.losses.SparseCategoricalCrossentropy.__name__])
+          seg_loss = seg_loss_layer(labels['image_masks'], seg_outputs)
+          total_loss += seg_loss
+          loss_vals['seg_loss'] = seg_loss
 
-      reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
-      loss_vals['reg_l2_loss'] = reg_l2_loss
-      total_loss += tf.cast(reg_l2_loss, images.dtype)
+        reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
+        loss_vals['reg_l2_loss'] = reg_l2_loss
+        total_loss += tf.cast(reg_l2_loss, images.dtype)
+        if isinstance(self.optimizer,
+                      tf.keras.mixed_precision.experimental.LossScaleOptimizer):
+          scaled_loss = self.optimizer.get_scaled_loss(total_loss)
+        else:
+          scaled_loss = total_loss
+      loss_vals['loss'] = total_loss
+      loss_vals['learning_rate'] = self.optimizer.learning_rate(
+          self.optimizer.iterations)
+      trainable_vars = self._freeze_vars()
+      scaled_gradients = tape.gradient(scaled_loss, trainable_vars)
       if isinstance(self.optimizer,
                     tf.keras.mixed_precision.experimental.LossScaleOptimizer):
-        scaled_loss = self.optimizer.get_scaled_loss(total_loss)
+        gradients = self.optimizer.get_unscaled_gradients(scaled_gradients)
       else:
-        scaled_loss = total_loss
-    loss_vals['loss'] = total_loss
-    loss_vals['learning_rate'] = self.optimizer.learning_rate(
-        self.optimizer.iterations)
-    trainable_vars = self._freeze_vars()
-    scaled_gradients = tape.gradient(scaled_loss, trainable_vars)
-    if isinstance(self.optimizer,
-                  tf.keras.mixed_precision.experimental.LossScaleOptimizer):
-      gradients = self.optimizer.get_unscaled_gradients(scaled_gradients)
+        gradients = scaled_gradients
+      if self.config.clip_gradients_norm > 0:
+        clip_norm = abs(self.config.clip_gradients_norm)
+        gradients = [
+            tf.clip_by_norm(g, clip_norm) if g is not None else None
+            for g in gradients
+        ]
+        gradients, _ = tf.clip_by_global_norm(gradients, clip_norm)
+        loss_vals['gradient_norm'] = tf.linalg.global_norm(gradients)
+      self.optimizer.apply_gradients(zip(gradients, trainable_vars))
     else:
-      gradients = scaled_gradients
-    if self.config.clip_gradients_norm > 0:
-      clip_norm = abs(self.config.clip_gradients_norm)
-      gradients = [
-          tf.clip_by_norm(g, clip_norm) if g is not None else None
-          for g in gradients
-      ]
-      gradients, _ = tf.clip_by_global_norm(gradients, clip_norm)
-      loss_vals['gradient_norm'] = tf.linalg.global_norm(gradients)
-    self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+      with tf.GradientTape() as tape:
+        cate_preds, kernel_preds = self(image, training=True)
+        total_loss = 0
+        loss_vals = self._solo_loss(cate_preds, kernel_preds, ins_pred, labels)        
+        total_loss += loss_vals['solo_loss']
+        total_loss += loss_vals['cate_loss']
+        #loss_vals['solo loss'] = solo_loss
+        #loss_vals['cate_loss'] = cate_preds
+        
+        reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
+        loss_vals['reg_l2_loss'] = reg_l2_loss
+        total_loss += tf.cast(reg_l2_loss, images.dtype)
+        if isinstance(self.optimizer,
+                      tf.keras.mixed_precision.experimental.LossScaleOptimizer):
+          scaled_loss = self.optimizer.get_scaled_loss(total_loss)
+        else:
+          scaled_loss = total_loss
+      loss_vals['loss'] = total_loss
+      loss_vals['learning_rate'] = self.optimizer.learning_rate(
+          self.optimizer.iterations)
+      # TODO: check the trainable variables for solo head    
+      trainable_vars = self._freeze_vars()
+      scaled_gradients = tape.gradient(scaled_loss, trainable_vars)
+      if isinstance(self.optimizer,
+                    tf.keras.mixed_precision.experimental.LossScaleOptimizer):
+        gradients = self.optimizer.get_unscaled_gradients(scaled_gradients)
+      else:
+        gradients = scaled_gradients
+      if self.config.clip_gradients_norm > 0:
+        clip_norm = abs(self.config.clip_gradients_norm)
+        gradients = [
+            tf.clip_by_norm(g, clip_norm) if g is not None else None
+            for g in gradients
+        ]
+        gradients, _ = tf.clip_by_global_norm(gradients, clip_norm)
+        loss_vals['gradient_norm'] = tf.linalg.global_norm(gradients)
+      self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+
     return loss_vals
 
   def test_step(self, data):
@@ -993,25 +1058,35 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       A dict record loss info.
     """
     images, labels = data
-    if len(self.config.heads) == 2:
-      cls_outputs, box_outputs, seg_outputs = self(images, training=False)
-    elif 'object_detection' in self.config.heads:
-      cls_outputs, box_outputs = self(images, training=False)
-    elif 'segmentation' in self.config.heads:
-      seg_outputs, = self(images, training=False)
-    total_loss = 0
-    loss_vals = {}
-    if 'object_detection' in self.config.heads:
-      det_loss = self._detection_loss(cls_outputs, box_outputs, labels,
-                                      loss_vals)
-      total_loss += det_loss
-    if 'segmentation' in self.config.heads:
-      seg_loss_layer = (
-          self.loss[tf.keras.losses.SparseCategoricalCrossentropy.__name__])
-      seg_loss = seg_loss_layer(labels['image_masks'], seg_outputs)
-      total_loss += seg_loss
-      loss_vals['seg_loss'] = seg_loss
-    reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
-    loss_vals['reg_l2_loss'] = reg_l2_loss
-    loss_vals['loss'] = total_loss + tf.cast(reg_l2_loss, images.dtype)
+    if not self.config.use_solo:    
+      if len(self.config.heads) == 2:
+        cls_outputs, box_outputs, seg_outputs = self(images, training=False)
+      elif 'object_detection' in self.config.heads:
+        cls_outputs, box_outputs = self(images, training=False)
+      elif 'segmentation' in self.config.heads:
+        seg_outputs, = self(images, training=False)
+      total_loss = 0
+      loss_vals = {}
+      if 'object_detection' in self.config.heads:
+        det_loss = self._detection_loss(cls_outputs, box_outputs, labels,
+                                        loss_vals)
+        total_loss += det_loss
+      if 'segmentation' in self.config.heads:
+        seg_loss_layer = (
+            self.loss[tf.keras.losses.SparseCategoricalCrossentropy.__name__])
+        seg_loss = seg_loss_layer(labels['image_masks'], seg_outputs)
+        total_loss += seg_loss
+        loss_vals['seg_loss'] = seg_loss
+      reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
+      loss_vals['reg_l2_loss'] = reg_l2_loss
+      loss_vals['loss'] = total_loss + tf.cast(reg_l2_loss, images.dtype)
+    else:
+      cate_preds, kernel_preds = self(images, training=False)
+      total_loss = 0
+      loss_vals = self._solo_loss(cate_preds, kernel_preds, ins_pred, labels)
+      total_loss += loss_vals['solo_loss']
+      total_loss += loss_vals['cate_loss']
+      reg_l2_loss = self._reg_l2_loss(self.config.weight_decay)
+      loss_vals['reg_l2_loss'] = reg_l2_loss
+      loss_vals['loss'] = total_loss + tf.cast(reg_l2_loss, images.dtype)
     return loss_vals

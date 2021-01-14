@@ -14,6 +14,7 @@ def test_mask_shape():
 
     config = hparams_config.get_efficientdet_config("efficientdet-d0")
     config.max_level = 5
+    #config.min_level = 2
     input = tf.ones([1, 512, 512, 3])
     tf.random.set_random_seed(SEED)
     model = efficientdet_keras.EfficientDetNet(config=config)
