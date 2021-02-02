@@ -391,7 +391,8 @@ class InputReader:
       classes = data['groundtruth_classes']
       classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
       areas = data['groundtruth_area']
-      is_crowds = data['groundtruth_is_crowd']
+      if 'groundtruth_is_crowd' in data:
+        is_crowds = data['groundtruth_is_crowd']
       image_masks = data.get('groundtruth_instance_masks', [])
       classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
 

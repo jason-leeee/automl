@@ -60,6 +60,7 @@ def create_tf_example(image_root, anno_root, image_id):
     ymax = []
     cat_ids = []
     style = []
+    is_crowd = []
     cate_names = []
     occlusion = []
     zoom_in = []
@@ -78,6 +79,7 @@ def create_tf_example(image_root, anno_root, image_id):
           ymin.append(float(box[1]))
           xmax.append(float(box[2]))
           ymax.append(float(box[3]))
+          is_crowd.append(0)
 
           cat_ids.append(anno[i]['category_id'])
           cate_names.append(anno[i]['category_name'].encode('utf-8'))
@@ -191,7 +193,9 @@ def create_tf_example(image_root, anno_root, image_id):
         'image/object/class/text':
             tfrecord_util.bytes_list_feature(cate_names),
         'image/object/class/label':
-            tfrecord_util.int64_list_feature(cat_ids),            
+            tfrecord_util.int64_list_feature(cat_ids),  
+        'image/object/is_crowd':
+             tfrecord_util.int64_list_feature(is_crowd),         
         'image/object/occlusion':
             tfrecord_util.int64_list_feature(occlusion),
         'image/object/style':
