@@ -31,10 +31,12 @@ def create_tf_example(image_root, anno_root, image_id):
     image_path = os.path.join(image_root, image_file_name)
     anno_file_name = str(image_id).zfill(6)+'.json'
     anno_path = os.path.join(anno_root, anno_file_name)
+    with tf.io.gfile.GFile(image_path, 'rb') as fid:
+      encoded_jpg = fid.read()
+      #encoded_jpg_io = io.BytesIO(encoded_jpg)
     image = Image.open(image_path)
     width, height = image.size
-    raw_image = image.read()
-    key = hashlib.sha256(raw_image).hexdigest()
+    key = hashlib.sha256(encoded_jpg).hexdigest()
     feature_dict = {
         'image/height':
             tfrecord_util.int64_feature(height),
@@ -49,7 +51,7 @@ def create_tf_example(image_root, anno_root, image_id):
         'image/encoded':
             tfrecord_util.bytes_feature(encoded_jpg),
     }
-    with open(anno_file_name, 'r') as f:
+    with open(anno_path, 'r') as f:
         anno = json.loads(f.read())
     # load item annotations
     xmin = []
@@ -78,7 +80,7 @@ def create_tf_example(image_root, anno_root, image_id):
           ymax.append(float(box[3]))
 
           cat_ids.append(anno[i]['category_id'])
-          cate_names.append(anno[i]['category_name'])
+          cate_names.append(anno[i]['category_name'].encode('utf-8'))
           style.append(anno[i]['style'])
           occlusion.append(anno[i]['occlusion'])
           zoom_in.append(anno[i]['zoom_in'])
@@ -87,6 +89,7 @@ def create_tf_example(image_root, anno_root, image_id):
           # encode to binary mask
           run_len_encoding = mask.frPyObjects(anno[i]['segmentation'], height, width)
           binary_mask = mask.decode(run_len_encoding)
+          binary_mask = np.amax(binary_mask, axis=2)
           pil_image = Image.fromarray(binary_mask)
           output_io = io.BytesIO()
           pil_image.save(output_io, format='PNG')
@@ -170,11 +173,11 @@ def create_tf_example(image_root, anno_root, image_id):
                   points[3 * n + 2] = points_v[n - 275]
           num_points = len(np.where(points_v > 0)[0])
           total_num_points.append(num_points)
-          object_landmarks.append(points.to_list())
+          object_landmarks.append(points.tolist())
     
     feature_dict.update({
         'image/obj_source':
-            tfrecord_util.bytes_feature(anno['source']),
+            tfrecord_util.bytes_feature(anno['source'].encode('utf-8')),
         'image/pair_id':
             tfrecord_util.int64_feature(anno['pair_id']),
         'image/object/bbox/xmin':
@@ -202,7 +205,7 @@ def create_tf_example(image_root, anno_root, image_id):
         'image/pnject/num_keypoints':
             tfrecord_util.int64_list_feature(total_num_points),    
         'image/object/mask':
-            tfrecord_util.bytes_list_feature([encoded_mask_png])
+            tfrecord_util.bytes_list_feature(encoded_mask_png)
     }) # TODO: include viewpoint features
     example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
     return key, example
@@ -259,7 +262,7 @@ def main(_):
     tf.io.gfile.mkdir(directory)
 
   _create_tf_record_from_coco_annotations(FLAGS.image_root, FLAGS.anno_root,
-                                          FLAGS.output_file_prefix,
+                                          18, FLAGS.output_file_prefix,
                                           FLAGS.num_shards)
 
 
