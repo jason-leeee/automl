@@ -30,8 +30,9 @@ def _get_source_id_from_encoded_image(parsed_tensors):
 class TfExampleDecoder(object):
   """Tensorflow Example proto decoder."""
 
-  def __init__(self, include_mask=False, regenerate_source_id=False):
+  def __init__(self, use_solo=False, include_mask=False, regenerate_source_id=False):
     self._include_mask = include_mask
+    self._use_solo = use_solo
     self._regenerate_source_id = regenerate_source_id
     self._keys_to_features = {
         'image/encoded': tf.FixedLenFeature((), tf.string),
@@ -138,11 +139,12 @@ class TfExampleDecoder(object):
                                               parsed_tensors['image/height'])
     parsed_tensors['image/width'] = tf.where(decode_image_shape, image_shape[1],
                                              parsed_tensors['image/width'])
-
-    is_crowds = tf.cond(
-        tf.greater(tf.shape(parsed_tensors['image/object/is_crowd'])[0], 0),
-        lambda: tf.cast(parsed_tensors['image/object/is_crowd'], dtype=tf.bool),
-        lambda: tf.zeros_like(parsed_tensors['image/object/class/label'], dtype=tf.bool))  # pylint: disable=line-too-long
+    if not self._use_solo:
+      # solo data tfrecord skips the is_crowd keyword
+      is_crowds = tf.cond(
+          tf.greater(tf.shape(parsed_tensors['image/object/is_crowd'])[0], 0),
+          lambda: tf.cast(parsed_tensors['image/object/is_crowd'], dtype=tf.bool),
+          lambda: tf.zeros_like(parsed_tensors['image/object/class/label'], dtype=tf.bool))  # pylint: disable=line-too-long
     if self._regenerate_source_id:
       source_id = _get_source_id_from_encoded_image(parsed_tensors)
     else:

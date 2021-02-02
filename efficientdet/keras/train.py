@@ -218,13 +218,21 @@ def main(_):
     if not file_pattern:
       raise ValueError('No matching files.')
 
-    return dataloader.InputReader(
+    if not config.use_solo:
+      return dataloader.InputReader(
+          file_pattern,
+          is_training=is_training,
+          use_fake_data=FLAGS.use_fake_data,
+          max_instances_per_image=config.max_instances_per_image,
+          debug=FLAGS.debug)(
+              config.as_dict())
+    else:
+      return dataloader.InputReader(
         file_pattern,
         is_training=is_training,
         use_fake_data=FLAGS.use_fake_data,
         max_instances_per_image=config.max_instances_per_image,
-        debug=FLAGS.debug)(
-            config.as_dict())
+        debug=FLAGS.debug)(config.as_dict(), use_solo=True)
 
   with ds_strategy.scope():
     if config.model_optimizations:
