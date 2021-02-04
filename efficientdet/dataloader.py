@@ -391,8 +391,7 @@ class InputReader:
       classes = data['groundtruth_classes']
       classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
       areas = data['groundtruth_area']
-      if 'groundtruth_is_crowd' in data:
-        is_crowds = data['groundtruth_is_crowd']
+      is_crowds = data['groundtruth_is_crowd']
       image_masks = data.get('groundtruth_instance_masks', [])
       classes = tf.reshape(tf.cast(classes, dtype=tf.float32), [-1, 1])
 
@@ -436,8 +435,8 @@ class InputReader:
       source_id = tf.strings.to_number(source_id)
 
       # Pad groundtruth data for evaluation.
-      #image_scale = input_processor.image_scale_to_original
-      #boxes *= image_scale
+      image_scale = input_processor.image_scale_to_original
+      boxes *= image_scale
       is_crowds = tf.cast(is_crowds, dtype=tf.float32)
       boxes = pad_to_fixed_size(boxes, -1, [self._max_instances_per_image, 4])
       is_crowds = pad_to_fixed_size(is_crowds, 0,
@@ -445,8 +444,6 @@ class InputReader:
       areas = pad_to_fixed_size(areas, -1, [self._max_instances_per_image, 1])
       classes = pad_to_fixed_size(classes, -1,
                                   [self._max_instances_per_image, 1])
-      image_masks = pad_to_fixed_size(image_masks, -1, 
-                                      [self._max_instances_per_image, image.shape[0], image.shape[1]])
       return (image, source_id, boxes, is_crowds, areas, classes, image_masks)
 
   @tf.autograph.experimental.do_not_convert

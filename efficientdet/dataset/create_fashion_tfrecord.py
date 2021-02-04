@@ -13,12 +13,12 @@ import PIL.Image as Image
 
 from pycocotools import mask
 import tensorflow as tf
-from dataset import label_map_util
-from dataset import tfrecord_util
+import label_map_util
+import tfrecord_util
 
 flags.DEFINE_string('image_root', '', 'Directory containing images.')
 flags.DEFINE_string('anno_root', '', 'Directory containing annotations.')
-flags.DEFINE_string('output_file_prefix', '/tmp/train', 'Path to output file')
+flags.DEFINE_string('output_file_prefix', 'tmp/train', 'Path to output file')
 flags.DEFINE_integer('num_shards', 32, 'Number of shards for output file.')
 flags.DEFINE_integer('num_threads', None, 'Number of threads to run.')
 FLAGS = flags.FLAGS
@@ -267,7 +267,7 @@ def main(_):
 
   _create_tf_record_from_coco_annotations(FLAGS.image_root, FLAGS.anno_root,
                                           18, FLAGS.output_file_prefix,
-                                          FLAGS.num_shards)
+                                          2)
 
 
 if __name__ == '__main__':
