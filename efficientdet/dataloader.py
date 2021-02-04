@@ -444,7 +444,7 @@ class InputReader:
       areas = pad_to_fixed_size(areas, -1, [self._max_instances_per_image, 1])
       classes = pad_to_fixed_size(classes, -1,
                                   [self._max_instances_per_image, 1])
-      return (image, source_id, boxes, is_crowds, areas, classes, image_masks)
+      return (image, source_id, image_scale, boxes, is_crowds, areas, classes, image_masks)
 
   @tf.autograph.experimental.do_not_convert
   def process_example(self, params, batch_size, images, cls_targets,
@@ -490,7 +490,7 @@ class InputReader:
     labels['gt_bboxes'] = boxes
     labels['is_corwds'] = is_crowds
     labels['gt_labels'] = classes
-    lalbels['areas'] = areas 
+    labels['areas'] = areas 
     labels['image_scales'] = image_scales
     labels['gt_masks'] = image_masks
     return images, labels  
