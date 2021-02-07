@@ -528,7 +528,7 @@ class BoxIouLoss(tf.keras.losses.Loss):
 class SOLOLoss(tf.keras.losses.Loss):
   def __init__(self, ins_loss_weight, 
                 cate_out_channels, cfg, 
-                strides=(4, 8, 16, 32, 64),
+                strides=[4, 8, 16, 32, 64],
                 scale_ranges=((8, 32), (16, 64), (32, 128), (64, 256), (128, 512)),
                 sigma=0.2,
                 alpha=0.25,
@@ -549,7 +549,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     self.cate_out_channels = cate_out_channels - 1
     self.sigma = sigma
     self.gamma = gamma
-    self.alpha = alpha
+    self.alpha = alpha  
     self.label_smoothing = label_smoothing
     self.dtype = dtype
 
@@ -576,7 +576,7 @@ class SOLOLoss(tf.keras.losses.Loss):
     Args:
       gt_bboxes_raw: shape of [num_objects, 4]
       gt_labels_raw: shape of [num_objects, 1]
-      gt_masks_raw: shape of [num_object, 1, H, W]
+      gt_masks_raw: shape of [num_object, H, W, 1]
     """                      
     gt_areas = tf.math.sqrt((gt_bboxes_raw[:, 2] - gt_bboxes_raw[:, 0]) * (
                 gt_bboxes_raw[:, 3] - gt_bboxes_raw[:, 1]))
@@ -589,8 +589,9 @@ class SOLOLoss(tf.keras.losses.Loss):
 
     for (lower_bound, upper_bound), stride, num_grid \
           in zip(self.scale_ranges, self.strides, self.seg_num_grids):
-      hit_indices = tf.keras.backend.flatten(tf.where(((gt_areas >= lower_bound) and (gt_areas <= upper_bound))))
-      num_ins = len(hit_indices)
+      hit_indices = tf.keras.backend.flatten(tf.where((gt_areas >= lower_bound) \
+                                                      and (gt_areas <= upper_bound)))
+      num_ins = tf.math.count_nonzero(hit_indices)
       ins_label = []
       grid_order = []
       cate_label = tf.zeros([num_grid, num_grid], dtype=tf.int64).numpy()
@@ -776,18 +777,32 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
     """
     precision = utils.get_precision(self.config.strategy, self.config.mixed_precision)
     dtype = precision.split('_')[-1]
- 
+    print(labels)
     
-    gt_bbox_list = labels['gt_bbox_list'].to_list()
-    gt_label_list = labels['gt_label_list'].to_list()
-    gt_mask_list = labels['gt_mask_list'].to_list()
+    gt_bbox_list = labels['gt_bboxes']
+    gt_label_list = labels['gt_labels']
+    gt_mask_list = labels['gt_masks']
 
     y_preds = (cate_preds, kernel_preds, ins_pred)
     y_true = (gt_bbox_list, gt_label_list, gt_mask_list)
     # Data format is channels_last [B, H, W, C]
     class_loss_layer = self.loss.get(SOLOLoss.__name__, None)
     class_loss_layer.set_dtype(dtype)
-    ins_pred_list, ins_labels, cate_label_list, num_ins = class_loss_layer.generate_targets(ins_pred,
+
+    # Convert tensor of shape [B, max_objects, ...] into a nested list
+    def convert_to_list(batched_tensor):
+      batch_size = batched_tensor.shape[0]
+      res_list = []
+      for i in range(batch_size):
+        res_list.append(batched_tensor[i])
+      return res_list
+    
+    gt_bbox_list = convert_to_list(gt_bbox_list)
+    gt_label_list = convert_to_list(gt_label_list)
+    gt_mask_list = convert_to_list(gt_mask_list)
+
+    ins_pred_list, ins_labels, cate_label_list, num_ins = class_loss_layer.generate_targets(kernel_preds,
+                                                                                            ins_pred,
                                                                                             gt_bbox_list,
                                                                                             gt_label_list,
                                                                                             gt_mask_list)
@@ -1005,7 +1020,7 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       self.optimizer.apply_gradients(zip(gradients, trainable_vars))
     else:
       with tf.GradientTape() as tape:
-        cate_preds, kernel_preds = self(image, training=True)
+        ins_pred, cate_preds, kernel_preds = self(images, training=True)
         total_loss = 0
         loss_vals = self._solo_loss(cate_preds, kernel_preds, ins_pred, labels)        
         total_loss += loss_vals['solo_loss']
@@ -1081,7 +1096,7 @@ class EfficientDetNetTrain(efficientdet_keras.EfficientDetNet):
       loss_vals['reg_l2_loss'] = reg_l2_loss
       loss_vals['loss'] = total_loss + tf.cast(reg_l2_loss, images.dtype)
     else:
-      cate_preds, kernel_preds = self(images, training=False)
+      ins_pred, cate_preds, kernel_preds = self(images, training=False)
       total_loss = 0
       loss_vals = self._solo_loss(cate_preds, kernel_preds, ins_pred, labels)
       total_loss += loss_vals['solo_loss']

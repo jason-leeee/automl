@@ -5,16 +5,14 @@ class MaskFeatHead(tf.keras.layers.Layer):
 
     def __init__(self,
                 num_classes,
-                in_channels,
                 out_channels,
                 is_training_bn,
-                batch_size,
                 strategy,
                 start_level,
                 end_level,
-                name="mask_feat_head"):
-        super().__init__(name=name)
-        self.in_channels = in_channels
+                name="mask_feat_head",
+                **kwargs):
+        super().__init__(name=name, **kwargs)
         self.out_channels = out_channels
         self.start_level = start_level
         self.end_level = end_level
@@ -58,6 +56,7 @@ class MaskFeatHead(tf.keras.layers.Layer):
         self.conv_pred = tf.keras.layers.Conv2D(self.num_classes, 1, padding='valid')
 
     def call(self, inputs):
+        print(inputs)
         assert len(inputs) == (self.end_level - self.start_level + 1)
         #for input in inputs:
         #    print("fpn feature map size:", input.shape)
@@ -66,11 +65,16 @@ class MaskFeatHead(tf.keras.layers.Layer):
 
         for i in range(1, len(inputs)):
             input_p = inputs[i]
+            print(input_p)
+            print('input shape is:', input_p.shape)
             if i == 3:
                 input_feat = input_p
                 x_range = tf.linspace(-1, 1, input_feat.shape[-3])
                 y_range = tf.linspace(-1, 1, input_feat.shape[-2])
-                y, x = tf.meshgrid(y_range, x_range)   
+                y, x = tf.meshgrid(y_range, x_range)  
+                y = tf.cast(tf.expand_dims(y, -1), input_feat.dtype)
+                x = tf.cast(tf.expand_dims(x, -1), input_feat.dtype)
+                print(y) 
                 y = tf.broadcast_to(y, [input_feat.shape[0], -1, -1, 1])
                 x = tf.broadcast_to(x, [input_feat.shape[0], -1, -1, 1])
                 coord_feat = tf.concat([x, y], -1)

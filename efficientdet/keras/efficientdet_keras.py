@@ -27,6 +27,7 @@ from keras import fpn_configs
 from keras import postprocess
 from keras import util_keras
 from keras import tfmot
+from keras import mask_feat_head
 # pylint: disable=arguments-differ  # fo keras layers.
 
 
@@ -681,8 +682,10 @@ class SOLOv2Head(tf.keras.layers.Layer):
                 stacked_convs=4,
                 strides=(4, 8, 16, 32, 64),
                 base_edge_list=(16, 32, 64, 128, 256),
-                num_grids=None):
-    super().__init__()
+                num_grids=None,
+                name='solo_head',
+                **kwargs):
+    super().__init__(name=name, **kwargs)
     self.num_classes = num_classes
     self.seg_num_grids = num_grids
     #self.cate_out_channels = self.num_classes - 1
@@ -1086,6 +1089,28 @@ class EfficientDetNet(tf.keras.Model):
             strategy=config.strategy,
             data_format=config.data_format)
 
+      if head == 'solo':
+        self.solo_head = SOLOv2Head(
+            num_classes=config.num_classes,
+            strategy=config.strategy,
+            data_format=config.data_format,
+            is_training_bn=config.is_training_bn,
+            num_filters=64,
+            stacked_convs=4,
+            strides=(4, 8, 16, 32, 64),
+            base_edge_list=(16, 32, 64, 128, 256),
+            num_grids=[4,6,8,10,12]
+        )
+      
+        self.mask_feat_head = mask_feat_head.MaskFeatHead(
+            num_classes=config.num_classes,
+            out_channels=config.mask_out_channels,
+            is_training_bn=config.is_training_bn,
+            strategy=config.strategy,
+            start_level=config.min_level,
+            end_level=config.max_level
+        )
+
   def _init_set_name(self, name, zero_based=True):
     """A hack to allow empty model name for legacy checkpoint compitability."""
     if name == '':  # pylint: disable=g-explicit-bool-comparison
@@ -1115,6 +1140,10 @@ class EfficientDetNet(tf.keras.Model):
     if 'segmentation' in config.heads:
       seg_outputs = self.seg_head(fpn_feats, training)
       outputs.append(seg_outputs)
+    if 'solo' in config.heads:
+      ins_pred = self.mask_feat_head(fpn_feats)
+      cate_preds, kernel_preds = self.solo_head(fpn_feats)
+      outputs.extend([ins_pred, cate_preds, kernel_preds])
     return tuple(outputs)
 
 
